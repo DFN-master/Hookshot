@@ -25,6 +25,7 @@
 #include "gpu_choice.h"
 #include "vk_menu.h"
 #include "vk_streamline.h"
+#include "vk_ffx.h"
 #include "vk_opennr.h"   // (hookshot: open neural rendering's extensions, only when it is the selected backend)
 #include "vk_dlss.h"
 #include "vk_reflex.h"
@@ -534,6 +535,7 @@ bool create_device() {
     if (dev.buffer_marker) buffer_markers_init();
     coopmat_init();
     opennr::device_created();   // (hookshot: whether open neural rendering can run here, said in the log)
+    ffx::probe();   // (hookshot: what AMD's FSR 4 runtime offers here, asked once, now: gpu/vk/vk_ffx.h)
     reflex_device_created();
     if (dev.push_descriptor) {
         VkPhysicalDevicePushDescriptorPropertiesKHR pp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};

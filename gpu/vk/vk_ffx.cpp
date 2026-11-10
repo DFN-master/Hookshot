@@ -95,6 +95,46 @@ std::wstring find_loader() {
     return {};
 }
 
+// (hookshot) Every call into AMD's DLLs goes through these: a fault inside the runtime (a driver it does not expect, a
+// provider that dereferences what an NVIDIA device does not have) costs FSR 4, not the game. Plain C functions with no
+// objects to unwind, which is what __try needs; noinline so the guard stays around the call.
+__declspec(noinline) HMODULE guarded_load(const wchar_t* path) {
+    __try {
+        return LoadLibraryExW(path, nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    } __except (1) {
+        return nullptr;
+    }
+}
+constexpr ffxReturnCode_t kFaulted = 0xfa17;   // (not one of the API's codes: the call faulted)
+__declspec(noinline) ffxReturnCode_t guarded_query(PfnFfxQuery f, ffxContext* c, ffxQueryDescHeader* d) {
+    __try {
+        return f(c, d);
+    } __except (1) {
+        return kFaulted;
+    }
+}
+__declspec(noinline) ffxReturnCode_t guarded_create(PfnFfxCreateContext f, ffxContext* c, ffxCreateContextDescHeader* d) {
+    __try {
+        return f(c, d, nullptr);
+    } __except (1) {
+        return kFaulted;
+    }
+}
+__declspec(noinline) ffxReturnCode_t guarded_configure(PfnFfxConfigure f, ffxContext* c, const ffxConfigureDescHeader* d) {
+    __try {
+        return f(c, d);
+    } __except (1) {
+        return kFaulted;
+    }
+}
+__declspec(noinline) ffxReturnCode_t guarded_dispatch(PfnFfxDispatch f, ffxContext* c, const ffxDispatchDescHeader* d) {
+    __try {
+        return f(c, d);
+    } __except (1) {
+        return kFaulted;
+    }
+}
+
 bool load() {
     State& s = st();
     if (s.tried) return s.module != nullptr;
@@ -110,7 +150,8 @@ bool load() {
         return false;
     }
     // (the loader looks for the upscaler and frame generation DLLs in its own folder)
-    s.module = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    logf("vk: amd fsr 4: loading AMD's runtime");
+    s.module = guarded_load(path.c_str());
     if (!s.module) {
         logf("vk: amd fsr 4: amd_fidelityfx_loader_vk.dll did not load (error %lu)", GetLastError());
         return false;
@@ -156,13 +197,13 @@ uint64_t providers(uint64_t create_type, std::string& name) {
     q.createDescType = create_type;
     q.device = &c;
     q.outputCount = &count;
-    if (s.query(nullptr, &q.header) != FFX_API_RETURN_OK || count == 0) return 0;
+    if (guarded_query(s.query, nullptr, &q.header) != FFX_API_RETURN_OK || count == 0) return 0;
     uint64_t ids[16]{};
     const char* names[16]{};
     count = std::min<uint64_t>(count, 16);
     q.versionIds = ids;
     q.versionNames = names;
-    if (s.query(nullptr, &q.header) != FFX_API_RETURN_OK) return 0;
+    if (guarded_query(s.query, nullptr, &q.header) != FFX_API_RETURN_OK) return 0;
     std::string all;
     for (uint64_t i = 0; i < count; i++) all += (i ? ", " : "") + std::string(names[i] ? names[i] : "?");
     name = names[0] ? names[0] : "";
@@ -261,19 +302,35 @@ void full_barrier(VkCommandBuffer cmd) {
 
 bool built() { return true; }
 
-bool upscale_supported() {
+void probe_upscale();
+void probe_frames();
+
+// (hookshot) AMD's runtime is asked once, at the start, from the render thread (probe(), from vk_main.cpp once the device
+// exists), with a line in the log before each call into it, so a runtime that hangs or faults names itself. The Insert
+// menu and the frame only read what it answered: v2.0.13 asked from the menu's first draw, where an answer that never
+// came meant a menu that never opened.
+void probe() {
     State& s = st();
-    if (s.up_supported >= 0) return s.up_supported != 0;
-    if (!dev.device) return false;   // (asked again once there is a device)
-    s.up_supported = 0;
-    if (!load()) return false;
+    if (s.up_supported >= 0 || !dev.device) return;
+    s.up_supported = s.fg_supported = 0;
+    if (!load()) return;
+    logf("vk: amd fsr 4: asking AMD's runtime what it offers on this GPU");
+    probe_upscale();
+    probe_frames();
+    logf("vk: amd fsr 4: AMD's runtime answered: upscaling %s, frame generation %s", s.up_supported ? "yes" : "no",
+         s.fg_supported ? "yes" : "no");
+}
+
+bool upscale_supported() { return st().up_supported > 0; }
+
+void probe_upscale() {
+    State& s = st();
     if (!providers(FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, s.up_provider)) {
         logf("vk: amd fsr 4: AMD's runtime has no upscaler for this GPU");
-        return false;
+        return;
     }
     logf("vk: amd fsr 4: upscaling available (%s)", s.up_provider.c_str());
     s.up_supported = 1;
-    return true;
 }
 
 const char* upscale_provider() { return st().up_provider.c_str(); }
@@ -304,7 +361,7 @@ bool upscale(VkCommandBuffer cmd, const UpscaleInputs& in) {
         c.maxRenderSize = {in.upscale_width, in.upscale_height};
         c.maxUpscaleSize = {in.upscale_width, in.upscale_height};
         c.fpMessage = message;
-        const ffxReturnCode_t r = s.create(&s.up, &c.header, nullptr);
+        const ffxReturnCode_t r = guarded_create(s.create, &s.up, &c.header);
         if (r != FFX_API_RETURN_OK || !s.up) {
             logf("vk: amd fsr 4: the upscaler's context was not made (FSR API result %u): FSR 4 is off", (unsigned)r);
             s.up = nullptr;
@@ -321,7 +378,7 @@ bool upscale(VkCommandBuffer cmd, const UpscaleInputs& in) {
         s.up_first = true;
         ffxQueryGetProviderVersion v{};
         v.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
-        if (s.query(&s.up, &v.header) == FFX_API_RETURN_OK && v.versionName) s.up_provider = v.versionName;
+        if (guarded_query(s.query, &s.up, &v.header) == FFX_API_RETURN_OK && v.versionName) s.up_provider = v.versionName;
         logf("vk: amd fsr 4: %s from up to %ux%u to %ux%u", s.up_provider.c_str(), s.up_rw, s.up_rh, s.up_ow, s.up_oh);
     }
     LARGE_INTEGER now, freq;
@@ -356,7 +413,7 @@ bool upscale(VkCommandBuffer cmd, const UpscaleInputs& in) {
     d.viewSpaceToMetersFactor = 1.0f;
     d.flags = 0;
     full_barrier(cmd);
-    const ffxReturnCode_t r = s.dispatch(&s.up, &d.header);
+    const ffxReturnCode_t r = guarded_dispatch(s.dispatch, &s.up, &d.header);
     full_barrier(cmd);
     s.up_first = false;
     if (r != FFX_API_RETURN_OK) {
@@ -369,20 +426,17 @@ bool upscale(VkCommandBuffer cmd, const UpscaleInputs& in) {
 
 VkImage output_image() { return st().up_out.image; }
 
-bool frames_supported() {
+bool frames_supported() { return st().fg_supported > 0; }
+
+void probe_frames() {
     State& s = st();
-    if (s.fg_supported >= 0) return s.fg_supported != 0;
-    if (!dev.device) return false;
-    s.fg_supported = 0;
-    if (env_int("RX_VK_FFX_FG", 1) == 0) return false;
-    if (!load()) return false;
+    if (env_int("RX_VK_FFX_FG", 1) == 0) return;
     if (!providers(FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION, s.fg_provider)) {
         logf("vk: amd fsr 4: AMD's runtime has no frame generation for this GPU");
-        return false;
+        return;
     }
     logf("vk: amd fsr 4: frame generation available (%s)", s.fg_provider.c_str());
     s.fg_supported = 1;
-    return true;
 }
 
 uint32_t frames_wanted() {
@@ -417,7 +471,7 @@ bool generate(VkCommandBuffer cmd, const FrameInputs& in) {
         c.displaySize = {in.width, in.height};
         c.maxRenderSize = {in.width, in.height};
         c.backBufferFormat = ffxApiGetSurfaceFormatVK(in.color_format);
-        const ffxReturnCode_t r = s.create(&s.fg, &c.header, nullptr);
+        const ffxReturnCode_t r = guarded_create(s.create, &s.fg, &c.header);
         if (r != FFX_API_RETURN_OK || !s.fg) {
             logf("vk: amd fsr 4: the frame generation context was not made (FSR API result %u): FSR frame "
                  "generation is off",
@@ -437,7 +491,7 @@ bool generate(VkCommandBuffer cmd, const FrameInputs& in) {
         s.fg_reset = true;
         ffxQueryGetProviderVersion v{};
         v.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
-        if (s.query(&s.fg, &v.header) == FFX_API_RETURN_OK && v.versionName) s.fg_provider = v.versionName;
+        if (guarded_query(s.query, &s.fg, &v.header) == FFX_API_RETURN_OK && v.versionName) s.fg_provider = v.versionName;
         logf("vk: amd fsr 4: %s frame generation at %ux%u", s.fg_provider.c_str(), s.fg_w, s.fg_h);
     }
     s.frame_id++;
@@ -456,7 +510,7 @@ bool generate(VkCommandBuffer cmd, const FrameInputs& in) {
     cfg.flags = env_int("RX_VK_FFX_DEBUG", 0) > 1 ? FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW : 0;
     cfg.generationRect = {0, 0, (int32_t)in.width, (int32_t)in.height};
     cfg.frameID = s.frame_id;
-    if (const ffxReturnCode_t r = s.configure(&s.fg, &cfg.header); r != FFX_API_RETURN_OK) {
+    if (const ffxReturnCode_t r = guarded_configure(s.configure, &s.fg, &cfg.header); r != FFX_API_RETURN_OK) {
         static int told = 0;
         if (told++ < 4) logf("vk: amd fsr 4: frame generation's configuration was refused (FSR API result %u)", (unsigned)r);
         return false;
@@ -492,7 +546,7 @@ bool generate(VkCommandBuffer cmd, const FrameInputs& in) {
         }
     }
     full_barrier(cmd);
-    if (const ffxReturnCode_t r = s.dispatch(&s.fg, &prep.header); r != FFX_API_RETURN_OK) {
+    if (const ffxReturnCode_t r = guarded_dispatch(s.dispatch, &s.fg, &prep.header); r != FFX_API_RETURN_OK) {
         static int told = 0;
         if (told++ < 4) logf("vk: amd fsr 4: frame generation's preparation was refused (FSR API result %u)", (unsigned)r);
         return false;
@@ -510,7 +564,7 @@ bool generate(VkCommandBuffer cmd, const FrameInputs& in) {
     d.minMaxLuminance[0] = 0.0f, d.minMaxLuminance[1] = 1.0f;
     d.generationRect = {0, 0, (int32_t)in.width, (int32_t)in.height};
     d.frameID = s.frame_id;
-    const ffxReturnCode_t r = s.dispatch(&s.fg, &d.header);
+    const ffxReturnCode_t r = guarded_dispatch(s.dispatch, &s.fg, &d.header);
     full_barrier(cmd);
     if (r != FFX_API_RETURN_OK) {
         static int told = 0;
@@ -543,6 +597,7 @@ void shutdown() {
 namespace mkwvk::ffx {
 
 bool built() { return false; }
+void probe() {}
 bool upscale_supported() { return false; }
 const char* upscale_provider() { return ""; }
 bool upscale(VkCommandBuffer, const UpscaleInputs&) { return false; }

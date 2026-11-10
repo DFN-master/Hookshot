@@ -42,6 +42,10 @@ struct UpscaleInputs {
 
 /// Whether this build has the backend at all: Windows only (AMD's runtime is Windows DLLs).
 [[nodiscard]] bool built();
+/// Asks AMD's runtime, once, what it offers on this device: called from vk_main.cpp right after the device is made, on the
+/// render thread, with each call into the runtime logged first and guarded. upscale_supported() and frames_supported()
+/// only read the answer (false before it), so the Insert menu never waits on AMD's DLLs.
+void probe();
 /// Whether FSR 4 upscaling can run here: a Windows build, amd_fidelityfx_loader_vk.dll found beside
 /// the game (or in RX_VK_FFX_DIR) and loaded, and AMD's runtime naming at least one upscaler for this
 /// device. Asked once, the answer cached; RX_VK_FFX=0 keeps the DLL from being loaded at all.
