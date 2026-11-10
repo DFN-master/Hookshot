@@ -872,16 +872,8 @@ def main():
         for f in ("imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp", "imgui_widgets.cpp", "backends/imgui_impl_vulkan.cpp"):
             vk_jobs.append((cxx, os.path.join(imgui, *f.split("/")),
                             os.path.join(obj_dir, "vk_imgui_" + os.path.basename(f)[:-4] + ".o"), vflags + imgui_flags, imgui_deps))
-        # (zstd's decoder, third_party/zstd, plain C)
-        zflags = target() + CPU + (["-fPIC"] if LINUX else []) + ["-O2", "-g0", "-DNDEBUG", "-Wno-everything", "-fvisibility=hidden",
-                                                                 "-DZSTD_DISABLE_ASM", "-DZSTD_LEGACY_SUPPORT=0", "-DZSTD_MULTITHREAD=0"]
-        zdeps = b"".join(open(os.path.join(d, f), "rb").read() for d in (zstd, os.path.join(zstd, "common"), os.path.join(zstd, "decompress"))
-                         for f in sorted(os.listdir(d)) if f.endswith(".h"))
-        for f in ("common/debug.c", "common/entropy_common.c", "common/error_private.c", "common/fse_decompress.c", "common/xxhash.c",
-                  "common/zstd_common.c", "decompress/huf_decompress.c", "decompress/zstd_ddict.c", "decompress/zstd_decompress.c",
-                  "decompress/zstd_decompress_block.c"):
-            vk_jobs.append((cc, os.path.join(zstd, *f.split("/")), os.path.join(obj_dir, "vk_zstd_" + os.path.basename(f)[:-2] + ".o"),
-                            zflags, zdeps))
+        # (zstd's decoder and encoder: third_party/zbic's single file, built below with the program cache's zstd; it serves
+        # the game's font files too, so the decompression-only third_party/zstd is not built as well)
         # (the bundled fonts, compiled in: nx2/ui_fonts.py's file of the build's own)
         vk_jobs.append((cxx, fonts_cpp, os.path.join(obj_dir, "vk_ui_fonts.o"), target() + (["-fPIC"] if LINUX else []) + ["-O0", "-g0", "-w"],
                         b""))
