@@ -561,6 +561,12 @@ true, and dead code elimination removes the grid walk, so every meshlet is drawn
 screen. It costs some GPU time on cards that cull quickly, so it is off unless set. The log says
 "culling off, every meshlet drawn" for each task shader it changed.
 
+`RX_VK_WB_MAX_KB=<KB>` stops the write-back of written GPU bindings larger than that. OoT writes tens of MB of culling
+lists and per-frame buffers through the GPU that the CPU never reads, and copying them back sat on every submit's
+memory sync: in Hyrule Field on a 10 GB RTX 3080, about 66 MB and 4.4 ms a submit, holding the scene at 45-48 fps.
+`RX_VK_WB_MAX_KB=1024` still copies the small results the CPU does read (the exposure meter and the like) and took the
+same scene to 59-60 fps. `0` or unset copies every written binding, as before.
+
 </details>
 
 ## How it works
