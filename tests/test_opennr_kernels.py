@@ -1,5 +1,8 @@
 """Open neural rendering's kernels: the checked-in SPIR-V still matches its sources, upstream's sources still take the
-portability patches the renderer is built with, and the PTX generators still produce every variant.
+portability patches the renderer is built with, and the PTX generators still produce every variant. And the khr
+route's: its checked-in SPIR-V (gpu/vk/shaders/opennr_khr_spv.h) matches gpu/vk/opennr/khr and the patched copies of
+upstream's kernels, and its variant table is the same in the script that compiles it and the header the renderer
+chooses with (gpu/vk/opennr/opennr_khr.h), so the renderer never picks a folder whose kernels assume another shape.
 
 The SPIR-V headers (gpu/vk/shaders/opennr_kernels_spv.h, opennr_pre/post_comp_spv.h) are compiled from
 third_party/opendlss-nr/shaders and gpu/vk/shaders by scripts/opennr_kernels.py; --check recompiles and compares.
@@ -9,6 +12,7 @@ first, with the generator's own error.
     python -I -B tests/test_opennr_kernels.py --glslang glslangValidator --spirv-val spirv-val
 """
 import argparse
+import re
 import subprocess
 import sys
 import tempfile
@@ -35,8 +39,37 @@ def main():
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     out = r.stdout.decode("utf-8", "replace")
     print(out.strip())
-    if r.returncode or "13 kernels and 2 frame passes match" not in out:
+    want = "13 kernels, %d khr variants and 2 frame passes match" % len(opennr_kernels.KHR_VARIANTS)
+    if r.returncode or want not in out:
         fail("the checked-in SPIR-V headers do not match their sources (python -I -B scripts/opennr_kernels.py)")
+
+    # the khr variant table, twice: the script's (what each folder is compiled for) and the renderer's (what it chooses)
+    header = (ROOT / "gpu" / "vk" / "opennr" / "opennr_khr.h").read_text(encoding="utf-8")
+    rows = re.findall(r'\{"([\w-]+)", (true|false), (\d+), (\d+), (\d+), (\d+), (true|false), (\d+), "', header)
+    table = [(n, int(e == "true"), int(m), int(nn), int(k), int(hk), int(acc == "true"), int(sg))
+             for n, e, m, nn, k, hk, acc, sg in rows]
+    script = [(n, d["KHR_E4"], d["KHR_M"], d["KHR_N"], d["KHR_K"], d["KHR_HK"], d["KHR_ACC32"], d["KHR_SG"])
+              for n, d, _ in opennr_kernels.KHR_VARIANTS]
+    if table != script:
+        fail("gpu/vk/opennr/opennr_khr.h kVariants %s is not scripts/opennr_kernels.py KHR_VARIANTS %s" % (table, script))
+    for name in opennr_kernels.KERNELS:   # (every one of the thirteen comes from exactly one place in a khr folder)
+        homes = [name in group for group in (opennr_kernels.KHR_OWN, opennr_kernels.KHR_PATCHED,
+                                             opennr_kernels.KHR_UPSTREAM, opennr_kernels.KHR_UNUSED)]
+        if homes.count(True) != 1:
+            fail("the khr folders take %s from %d places" % (name, homes.count(True)))
+    # the materialized folders hold all thirteen, and no khr module asks for an NV extension
+    with tempfile.TemporaryDirectory(prefix="opennr-khr-test-") as tmp:
+        khr = opennr_kernels.khr_header_words(opennr_kernels.KHR_HEADER.read_text(encoding="utf-8"))
+        upstream = opennr_kernels.header_words(opennr_kernels.KERNEL_HEADER.read_text(encoding="utf-8"))
+        for variant, _, _ in opennr_kernels.KHR_VARIANTS:
+            modules = opennr_kernels.khr_folder_modules(variant, khr, upstream)
+            if sorted(modules) != sorted(opennr_kernels.KERNELS):
+                fail("the khr folder %s holds %s" % (variant, sorted(modules)))
+        for entry, words in khr.items():
+            text = b"".join(w.to_bytes(4, "little") for w in words)
+            for nv in (b"SPV_NV_cooperative_matrix2", b"SPV_NV_", b"TensorAddressingNV"):
+                if nv in text:
+                    fail("khr module %s names %s" % (entry, nv.decode()))
 
     with tempfile.TemporaryDirectory(prefix="opennr-kernels-test-") as tmp:
         # every portability patch applies exactly once (prepare_sources raises otherwise), and changes only what it says
