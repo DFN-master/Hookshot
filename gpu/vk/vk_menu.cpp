@@ -510,7 +510,8 @@ const char* hn_framegen_method(int v, int variant) {
         "The best that runs here: DLSS, then FSR 4, then FSR 3.1, then the built-in blend. The log says which.",
         "NVIDIA's network, from the game's depth and motion: RTX 40 and 50, with nvngx_dlssg.dll in the game's ngx folder.",
         "AMD's FSR 4 frame generation, through AMD's runtime beside the game: Windows.",
-        "AMD's FSR 3.1 frame generation, built from AMD's open shaders: any GPU.",
+        "AMD's FSR 3.1 frame generation, built from AMD's open shaders: any GPU. At 2x only (it makes the frame halfway "
+        "between two of the game's): at 3x and above the built-in blend makes them.",
         "The renderer's own blend of the two frames around it: every GPU, the least sharp.",
     };
     if (variant < 0) v = fgm::effective(v, framegen_available());

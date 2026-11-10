@@ -853,7 +853,10 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         set->made = dlssg_frames(cmd, *set, cur, uw, uh, m);
     if (set->made == 0 && blend && m > 1 && fgm::tries(method, fgm::FSR4) && (avail & fgm::bit(fgm::FSR4)))
         set->made = ffx_frames(cmd, *set, cur, uw, uh, m);
-    if (set->made == 0 && blend && m > 1 && fgm::tries(method, fgm::FSR3) && (avail & fgm::bit(fgm::FSR3)))
+    // (FSR 3.1's interpolation makes the midpoint only: a 3x or larger set of it would show one picture at two times, so it
+    // takes 2x sets alone and the rest go on to the renderer's own interpolation: framegen_methods.h makes_set)
+    if (set->made == 0 && blend && m > 1 && fgm::tries(method, fgm::FSR3) && (avail & fgm::bit(fgm::FSR3)) &&
+        fgm::makes_set(fgm::FSR3, m))
         set->made = fsr3fi_frames(cmd, *set, cur, uw, uh, m);
     if (set->made == 0 && blend && m > 1) {
         pass(cmd, fg.flow, {{fg.lumas[prev].view, fg.nearest}, {fg.lumas[cur].view, fg.nearest},

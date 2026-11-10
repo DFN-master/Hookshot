@@ -29,7 +29,8 @@ def main():
             ("fgm::effective(chosen, avail)", fg, "vk_framegen.cpp choosing through framegen_methods.h"),
             ("fgm::tries(method, fgm::DLSS)", fg, "DLSS frame generation behind the choice"),
             ("fgm::tries(method, fgm::FSR4)", fg, "FSR 4 frame generation behind the choice"),
-            ("fgm::tries(method, fgm::FSR3)", fg, "FSR 3.1 frame generation behind the choice")):
+            ("fgm::tries(method, fgm::FSR3)", fg, "FSR 3.1 frame generation behind the choice"),
+            ("fgm::makes_set(fgm::FSR3, m)", fg, "FSR 3.1 frame generation for the sets it can make (2x)")):
         if needle not in where:
             raise SystemExit("missing: %s (%s)" % (what, needle))
     # (the choice is read each frame, so the menu's change reaches the next frame: not cached in a static)
