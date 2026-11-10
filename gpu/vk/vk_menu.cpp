@@ -210,6 +210,7 @@ const char* hn_upscaler(int v, int variant) {
         "DLSS and DLAA: need an NVIDIA RTX GPU.",
         "DLSS and DLAA: need a newer NVIDIA driver.",
         "DLSS and DLAA: DLSS's runtime was not found (the game folder's ngx folder, see the readme).",
+        "DLSS and DLAA: NVIDIA's NGX on Linux loads DLSS's runtime only from a folder named in ASCII (see the readme).",
     };
     // (now: the value shown and what runs here; every one: each value, and the game's own with each reason)
     int w = 0;
@@ -418,6 +419,10 @@ const char* hn_mic(int v, int variant) {
     return missing ? "Not plugged in: Default stands in until it is back." : "This microphone, by its name. A change applies at once.";
 }
 const char* tx_rumble(int v) { return v ? tx_percent(v) : "Off"; }
+const char* tx_stick_dead_zone(int v) {
+    static const char* t[] = {"Default (24%)", "5%", "10%", "15%", "20%", "30%"};
+    return (unsigned)v < 6 ? t[v] : t[0];
+}
 // (hookshot) Audio output: the speakers the game mixes for, read once at its start (host/nn_audio.c au_menu_output)
 const char* tx_audio_output(int v) {
     static const char* t[] = {"Auto", "Stereo", "5.1"};
@@ -613,7 +618,7 @@ Row rows[] = {
      "What the ocarina hears when the game's microphone option is on (playing an instrument, or humming).", hn_mic, false,
      true},
 
-    // Controls (14 rows)
+    // Controls (15 rows)
     {TAB_CONTROLS, "Controller in background", &opts.pad_background, 0, 1, 1, tx_onoff,
      "Whether the controller plays the game while another window has the focus.", hn_background},
     {TAB_CONTROLS, "Mouse camera", &opts.mouse_native, 0, 1, 1, tx_mousecam, "How the captured mouse turns the camera.",
@@ -627,11 +632,14 @@ Row rows[] = {
      "Inverts horizontal look (left/right) on the right analog stick.", nullptr, false, true},
     {TAB_CONTROLS, "Invert camera Y", &opts.invert_cam_y, 0, 1, 1, tx_onoff,
      "Inverts vertical look (up/down) on the right analog stick.", nullptr, false, true},
+    {TAB_CONTROLS, "Stick dead zone", &opts.stick_dead_zone, 0, 5, 1, tx_stick_dead_zone,
+     "How far a stick moves before the game sees it, on each axis. Lower for a precise stick, higher for one that drifts. "
+     "The game's own dead zone still follows.", nullptr, false, true},
     {TAB_CONTROLS, "Rumble strength", &opts.rumble, 0, 150, 25, tx_rumble,
      "How strongly the controller rumbles, in percent of the game's rumble. Off turns it off.", nullptr, false, true},
     {TAB_CONTROLS, "Motion controls", &opts.gyro, 0, 1, 1, tx_gyro,
      "Aiming and looking with the controller's gyroscope where the game uses motion, as on the Switch.", hn_gyro},
-    {TAB_CONTROLS, "Motion sensitivity X", &opts.gyro_sens_x, 10, 300, 10, tx_percent,
+    {TAB_CONTROLS, "Motion sensitivity X", &opts.gyro_sens_x, 10, 600, 10, tx_percent,
      "How far the aim moves left and right for a given turn of the controller. 100% is the console's own.", nullptr, false,
      true},
     {TAB_CONTROLS, "Motion sensitivity Y", &opts.gyro_sens_y, 10, 300, 10, tx_percent,

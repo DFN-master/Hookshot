@@ -262,6 +262,23 @@ def check_supported_build(exefs):
         fail("This is build %s. Hookshot supports build %s." % (bid[:8], BUILD_ID))
 
 
+def stand_in_damaged_files(romfs):
+    """An incomplete dump's damaged textures replaced by whole ones of the same kind, and said: without them the game
+    leaves out the walls and floors that use them (the Water Temple, #1002)"""
+    import nup
+    done = nup.stand_in_damaged(romfs)
+    if not done:
+        return
+    print("Your game dump is incomplete: %d game file%s in it %s damaged (a complete dump is about 23.8 GB, an incomplete "
+          "one 23.3 GB). Each is replaced by a similar file so that the places using it are still drawn, with a different "
+          "texture there. Dump the game again for the original look:" % (len(done), "" if len(done) == 1 else "s",
+                                                                          "is" if len(done) == 1 else "are"), flush=True)
+    for path, other in done:
+        print("  %s: %s" % (os.path.relpath(path, romfs),
+                            "in its place " + os.path.basename(other) if other else "nothing similar found, left as it is"),
+              flush=True)
+
+
 def check_cache_paths(out, paths):
     """Resolve generated paths and reject symbolic links/reparse points before replacement."""
     root = os.path.realpath(out)
@@ -1032,7 +1049,12 @@ def main(a=None):
     romfs = os.path.join(out, "romfs")
 
     say("stage", "read", "Reading your game files")
-    shutil.rmtree(exefs, ignore_errors=True)
+    try:
+        shutil.rmtree(exefs)
+    except OSError as e:
+        if not isinstance(e, FileNotFoundError) or os.path.lexists(exefs):
+            fail("Could not clear the builder's working copy of exefs at %s (%s). "
+                 "Close any other builds or programs using this folder, then try again." % (exefs, e))
     kept = os.path.join(out, ".hookshot_exefs")   # (the game's code as read, kept in the folder: what an update builds from again)
     if a.update:
         if not os.path.isdir(kept) or not os.path.isdir(romfs):
@@ -1048,7 +1070,11 @@ def main(a=None):
         good = os.path.join(out, ".hookshot_romfs")
         check_cache_paths(out, (game, good, kept, romfs))
         # (an update of the builder over the same .nup: nothing to read again, only what the build needs. Issues 21 and 28)
-        st = os.stat(a.nup)
+        try:
+            st = os.stat(a.nup)
+        except OSError as e:
+            fail("Could not access your .nup file %s: %s. Check that the file is still there, reconnect its drive if needed, "
+                 "or choose the file again in Hookshot Builder." % (a.nup, e))
         stamp = "unpacked by this builder: %s %d" % (os.path.basename(a.nup), st.st_size)
         same = False
         if os.path.exists(good) and os.path.isdir(romfs) and os.path.isdir(kept):
@@ -1076,6 +1102,8 @@ def main(a=None):
             with open(good, "w") as f:
                 f.write(stamp + chr(10))
         check_modules(exefs)
+        # (also when the .nup was read before: a folder built from a 23.3 GB dump by an earlier builder gets them too)
+        stand_in_damaged_files(romfs)
     else:
         shutil.copytree(a.exefs, exefs)   # (unpacked in place: the user's copy stays as it is)
         run(PY + ["nx2/unpack.py", exefs])
