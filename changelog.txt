@@ -1,4 +1,10 @@
 ---------------------------------------------------------------------------------------------------
+Version: 2.0.17
+Date: 10. 11. 2026
+  Bugfixes:
+    - Vk: FSR 3.1 and FSR 4 take the scene's real camera, depth and colour encoding (#1386's inputs).
+    - Vk: FSR 3.1 frame interpolation makes 2x sets only.
+---------------------------------------------------------------------------------------------------
 Version: 2.0.16
 Date: 10. 11. 2026
   Features:
