@@ -1,4 +1,10 @@
 ---------------------------------------------------------------------------------------------------
+Version: 2.0.15
+Date: 10. 11. 2026
+  Features:
+    - Vk: The open backend runs the khr route where upstream's NVIDIA routes cannot.
+    - Vk: The open backend's khr kernels, OpenDLSS-NR on VK_KHR_cooperative_matrix alone.
+---------------------------------------------------------------------------------------------------
 Version: 2.0.14
 Date: 10. 11. 2026
   Bugfixes:
