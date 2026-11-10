@@ -1,4 +1,35 @@
 ---------------------------------------------------------------------------------------------------
+Version: 2.0.16
+Date: 10. 11. 2026
+  Features:
+    - Raise the Motion sensitivity X limit to 600%.
+    - Linux: The OoT debug tools on Linux (cheats, teleport, flight, free view).
+    - Vk: FXAA in the gameplay TAAU stand-in (edges on cards without the network).
+  Bugfixes:
+    - Windows: Load the Vulkan loader and SDL from known folders only.
+    - Update: Check the latest release's tag on Windows too.
+    - Env: Hookshot_env.txt sets only the game's own switches.
+    - Fs: Keep guest paths in their mounts; do not work through links.
+    - Saves: Refuse links in a save being imported.
+    - Vk: Check the shaders seed, program cache, pipeline notes and state list as read.
+    - Builder: Check setup list names; load the setup's libraries from System32.
+    - Nvn: Keep host pointers in host-side tables; bounds-check guest ranges.
+    - Builder: Stop when the working exefs cannot be cleared.
+    - Vk: A timed-out batch of write-backs keeps its staging buffers; the sweep's budget test cannot wrap.
+    - Write out the queued log before a fatal replay exit.
+    - Input: Move the stick dead zone to option 11.
+    - Builder: Do not resolve the update staging directory itself.
+    - Linux: Reject symlinked update staging folders.
+    - Runtime: Report Windows display startup failures.
+    - Builder: Keep Linux update extraction from writing through symlinks.
+    - End the game when the GPU device is lost.
+    - Ignore half-float NaNs when locating flashes.
+    - Vk: Send the held batch before waiting for a recording.
+    - Sdl: Keep the mouse captured when the pointer leaves the window.
+    - Builder: Explain unavailable selected game input.
+  Optimizations:
+    - Vk: The retirement sweep's texture write-backs in batches, one submission and one wait each.
+---------------------------------------------------------------------------------------------------
 Version: 2.0.15
 Date: 10. 11. 2026
   Features:
