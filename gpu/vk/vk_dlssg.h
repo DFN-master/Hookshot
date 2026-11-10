@@ -67,8 +67,8 @@ struct Inputs {
     bool depth_inverted = true;
     bool colour_hdr = true;
     /// The motion already includes the camera's movement. Ours does: it *is* the camera's movement
-    /// (gpu/vk/vk_camera_motion.h), which is why this defaults true and why saying otherwise would
-    /// have the network apply the camera twice.
+    /// (gpu/vk/vk_fsr3_inputs.h, shaders/fsr3_prep.comp), which is why this defaults true and why
+    /// saying otherwise would have the network apply the camera twice.
     bool camera_motion_included = true;
     bool reset = false;
 

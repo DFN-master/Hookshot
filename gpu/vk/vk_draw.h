@@ -12,10 +12,10 @@ namespace mkwvk {
 void descriptors_disturbed();
 
 /// (hookshot) What the scene's last frame left behind, for a backend that runs outside the draw
-/// path. Frame generation is recorded at present time, where the scene's depth and the matrix its
-/// draws used are both out of reach; the draw path keeps them as it resolves the upscale dispatch
-/// and this is how they are read back. False when the scene has not been seen yet, which a caller
-/// takes as "do not generate this frame" rather than as a reason to guess.
+/// path: the open neural rendering backend (vk_opennr.cpp). The upscalers and frame generation take
+/// theirs from the scene's camera uniform buffer instead (gpu/vk/vk_fsr3_inputs.h). False when the
+/// scene has not been seen yet, which a caller takes as "nothing to give" rather than as a reason to
+/// guess.
 struct SceneFrameInputs {
     VkImage depth_image = VK_NULL_HANDLE;
     VkImageView depth_view = VK_NULL_HANDLE;
@@ -29,11 +29,6 @@ struct SceneFrameInputs {
     bool have_view_projection = false;
 };
 bool scene_frame_inputs(SceneFrameInputs* out);
-
-/// (hookshot) The sub-pixel offset this frame's scene was rasterized with, in render pixels, for the
-/// backend that has to undo it. False when nothing is jittering, which a backend takes as "no
-/// offset" and not as "use the last one".
-bool scene_jitter(float* x, float* y);
 
 /// A graphics pipeline as hookshot_pipelines.bin keeps it (the precompile's notes): what built it
 struct PipeNote {

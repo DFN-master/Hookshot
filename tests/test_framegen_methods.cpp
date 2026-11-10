@@ -23,6 +23,14 @@ int main() {
     CHECK("Auto tries every vendor method", tries(AUTO, DLSS) && tries(AUTO, FSR4) && tries(AUTO, FSR3));
     CHECK("a chosen method alone", tries(FSR3, FSR3) && !tries(FSR3, DLSS) && !tries(FSR3, FSR4));
     CHECK("built-in tries no vendor method", !tries(BUILTIN, DLSS) && !tries(BUILTIN, FSR4) && !tries(BUILTIN, FSR3));
+    // FSR 3.1 makes the midpoint only: 2x sets, never 3x and above (the same picture at two times would judder)
+    CHECK("FSR 3.1 makes 2x sets only", makes_set(FSR3, 2) && !makes_set(FSR3, 3) && !makes_set(FSR3, 8));
+    CHECK("the others make every set", makes_set(DLSS, 4) && makes_set(FSR4, 5) && makes_set(BUILTIN, 8));
+    CHECK("Auto tries the best first", first(AUTO, all, 2) == DLSS && first(AUTO, bit(FSR4) | bit(FSR3), 3) == FSR4 &&
+                                           first(AUTO, fsr3, 2) == FSR3);
+    CHECK("FSR 3.1 at 3x leaves the set to the built-in blend", first(AUTO, fsr3, 3) == BUILTIN &&
+                                                                  first(FSR3, all, 4) == BUILTIN && first(FSR3, all, 2) == FSR3);
+    CHECK("built-in and what does not run", first(BUILTIN, all, 2) == BUILTIN && first(DLSS, fsr3, 2) == BUILTIN);
     if (failures) return 1;
     std::printf("PASS: the Frame generation method row steps over what runs, and Auto or one method is tried\n");
     return 0;

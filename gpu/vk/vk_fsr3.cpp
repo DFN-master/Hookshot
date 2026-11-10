@@ -1,46 +1,43 @@
-// (hookshot) FSR 3.1's pipelines and internal images. The dispatch half follows; see vk_fsr3.h.
+// (hookshot) AMD FSR 3.1's upscaler as our own dispatches over AMD's vendored passes, and its place in the gameplay upscale's
+// dispatch (fsr3_upscale, at the end); see vk_fsr3.h.
 //
-// The resource table and the per-pass binding lists are the SDK's, not ours: ffx_fsr3upscaler.cpp
-// decides the formats and sizes, and each pass file numbers its own bindings (FSR3UPSCALER_BIND_*).
-// Getting one wrong is a validation error at best and a wrong picture at worst, so they are written
-// out here in the SDK's order rather than derived.
+// The resource table and the per-pass binding lists are the SDK's, not ours: ffx_fsr3upscaler.cpp decides the formats and
+// sizes, and each pass file numbers its own bindings (FSR3UPSCALER_BIND_*). Getting one wrong is a validation error at best
+// and a wrong picture at worst, so they are written out here in the SDK's order rather than derived.
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
 #include <cmath>
-#include <cstring>
-#include <string>
-#include <initializer_list>
-#include <utility>
 #include <cstdlib>
+#include <cstring>
+#include <initializer_list>
+#include <mutex>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "vk_fsr3.h"
-#include "vk_gprof.h"    // (RX_VK_PASS_TIMING: a span per pass, so the report names them)
-#include <chrono>
+#include "vk_fsr3_inputs.h"
+#include "vk_draw.h"      // (descriptors_disturbed)
+#include "vk_ffx.h"       // (hookshot fork: AMD FSR 4 in the same place, from the same inputs)
+#include "vk_gprof.h"     // (RX_VK_PASS_TIMING: a span per pass, so the report names them)
+#include "vk_menu.h"
+#include "vk_texture.h"
+#include "upscaler_rows.h"
 
-#include "vk_texture.h"   // (full_barrier: what the rest of the renderer uses between passes)
-
+#include "shaders/dlss_out_comp_spv.h"   // (the network's output from a picture: its encoding squared back, as for DLSS)
 #include "shaders/fsr3_accumulate_comp_spv.h"
-#include "shaders/fsr3_accumulate_sharpen_comp_spv.h"
 #include "shaders/fsr3_luma_instability_comp_spv.h"
 #include "shaders/fsr3_luma_pyramid_comp_spv.h"
 #include "shaders/fsr3_luma_pyramid_nowave_comp_spv.h"
 #include "shaders/fsr3_prepare_inputs_comp_spv.h"
 #include "shaders/fsr3_prepare_reactivity_comp_spv.h"
-#include "shaders/fsr3_rcas_comp_spv.h"
 #include "shaders/fsr3_shading_change_comp_spv.h"
 #include "shaders/fsr3_shading_change_pyramid_comp_spv.h"
 #include "shaders/fsr3_shading_change_pyramid_nowave_comp_spv.h"
+#include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk::fsr3 {
-int fsr_stage() {
-    static const int n = []() {
-        const char* e = getenv("RX_VK_FSR_STAGE");
-        return e ? atoi(e) : 0;
-    }();
-    return n;
-}
-
 namespace {
 
 /// A descriptor's kind, in the binding order each pass file declares. Every pass also takes the two
@@ -62,12 +59,12 @@ constexpr Kind SHADING_CHANGE[]{T, I, U};
 constexpr Kind PREPARE_REACTIVITY[]{T, T, T, T, T, T, T, T, T, I, I, I, U};
 constexpr Kind LUMA_INSTABILITY[]{T, T, T, T, T, T, T, I, I, U};
 constexpr Kind ACCUMULATE[]{T, T, T, T, T, T, T, T, T, I, I, I, U};
-constexpr Kind RCAS[]{T, T, I, U, U};
 
 #define PASS(n, spv, b) PassInfo{n, spv, sizeof spv, b, sizeof b / sizeof b[0]}
 
-/// The passes, in the order PassId numbers them. The two _nowave pyramids are alternatives to the
-/// two before them, for devices without the subgroup operations the single-pass downsampler wants.
+/// The passes, in the order PassId numbers them. The two _nowave pyramids are alternatives to the two before them, for
+/// devices without the subgroup operations the single-pass downsampler wants. FSR's own sharpening (accumulate_sharpen and
+/// RCAS, compiled with the rest) is not used: the renderer's Sharpness row sharpens the finished picture for every upscaler
 const PassInfo PASSES[]{
     PASS("prepare_inputs", FSR3_PREPARE_INPUTS_COMP_SPV, PREPARE_INPUTS),
     PASS("luma_pyramid", FSR3_LUMA_PYRAMID_COMP_SPV, LUMA_PYRAMID),
@@ -79,12 +76,22 @@ const PassInfo PASSES[]{
     PASS("prepare_reactivity", FSR3_PREPARE_REACTIVITY_COMP_SPV, PREPARE_REACTIVITY),
     PASS("luma_instability", FSR3_LUMA_INSTABILITY_COMP_SPV, LUMA_INSTABILITY),
     PASS("accumulate", FSR3_ACCUMULATE_COMP_SPV, ACCUMULATE),
-    PASS("accumulate_sharpen", FSR3_ACCUMULATE_SHARPEN_COMP_SPV, ACCUMULATE),
-    PASS("rcas", FSR3_RCAS_COMP_SPV, RCAS),
 };
 #undef PASS
 
-constexpr size_t kPassCount = sizeof PASSES / sizeof PASSES[0];
+enum PassId : size_t {
+    P_PREPARE_INPUTS,
+    P_LUMA_PYRAMID,
+    P_LUMA_PYRAMID_NOWAVE,
+    P_SHADING_CHANGE_PYRAMID,
+    P_SHADING_CHANGE_PYRAMID_NOWAVE,
+    P_SHADING_CHANGE,
+    P_PREPARE_REACTIVITY,
+    P_LUMA_INSTABILITY,
+    P_ACCUMULATE,
+    kPassCount
+};
+static_assert(sizeof PASSES / sizeof PASSES[0] == kPassCount, "PassId must name every pass");
 constexpr uint32_t kSpdStoredMips = 6;
 
 struct Pipeline {
@@ -138,33 +145,6 @@ struct SpdConstants {
     uint32_t render_size[2];
 };
 
-struct RcasConstants {
-    uint32_t config[4];
-};
-
-/// ffxFsr3UpscalerGetJitterPhaseCount.
-int32_t jitter_phase_count_for(uint32_t render_width, uint32_t display_width) {
-    const float ratio = (float)display_width / (float)std::max(1u, render_width);
-    return (int32_t)(8.0f * ratio * ratio);
-}
-
-/// FidelityFX's AU1_AH1_AF1: a float's bits as a half's.
-uint32_t half_bits(float v) {
-    const _Float16 h = (_Float16)v;
-    uint16_t bits = 0;
-    memcpy(&bits, &h, 2);
-    return bits;
-}
-
-/// FsrRcasCon from ffx_fsr1.h: the sharpness in both halves of the second word.
-void rcas_con(uint32_t* con, float sharpness) {
-    sharpness = std::exp2(-sharpness);
-    memcpy(&con[0], &sharpness, 4);
-    con[1] = half_bits(sharpness) | (half_bits(sharpness) << 16);
-    con[2] = 0;
-    con[3] = 0;
-}
-
 /// One descriptor of a dispatch: an image view, or a range of the uniform buffer.
 struct Resource {
     VkImageView view = VK_NULL_HANDLE;
@@ -189,6 +169,7 @@ constexpr VkImageSubresourceRange ALL_LEVELS{VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_RE
 struct State {
     bool tried = false;
     bool ok = false;
+    bool wave = true;   ///< the pyramids with subgroup operations (else their _nowave variants)
     Pipeline passes[kPassCount];
     VkSampler point = VK_NULL_HANDLE;
     VkSampler linear = VK_NULL_HANDLE;
@@ -198,38 +179,57 @@ struct State {
     Image dilated_motion_vectors, dilated_depth, previous_nearest_depth, dilated_reactive_masks;
     Image frame_info, spd_atomic, lanczos_lut, default_reactive, output;
     uint32_t render_width = 0, render_height = 0, upscale_width = 0, upscale_height = 0;
-    // The uniform buffer the three constant blocks are written into, one set of slots per frame in
-    // flight so a frame being read is not overwritten.
+    // The uniform buffer the constant blocks are written into, one set of slots per frame in flight so a frame being read
+    // is not overwritten.
     VkBuffer uniforms = VK_NULL_HANDLE;
     VmaAllocation uniforms_memory = nullptr;
     void* uniforms_mapped = nullptr;
-    VkDeviceSize slot_fsr = 0, slot_spd = 0, slot_rcas = 0, frame_stride = 0;
+    VkDeviceSize slot_fsr = 0, slot_spd = 0, frame_stride = 0;
     uint32_t uniform_frame = 0;
     // History, as fsr3upscalerDispatch carries it.
     int32_t previous_render_size[2]{};
     int32_t previous_upscale_size[2]{};
     float previous_jitter[2]{};
-    float jitter_phase_count = 0.0f;
     float frame_index = 0.0f;
     uint32_t parity = 0;
-    bool first_evaluation = true;
+    bool first_evaluation = true;   ///< the images are new: their first layout, cleared
     bool lut_uploaded = false;
+    // Images of an earlier size, freed once the frames that may still read them are done (texture_frame_no)
+    std::vector<std::pair<uint64_t, Image>> dead;
 };
 
 constexpr uint32_t kUniformFrames = 4;   // (more than the swapchain's images in flight)
 
 State g;
 
-void drop_image(Image& t) {
+void destroy_now(Image& t) {
     for (VkImageView v : t.levels) vkDestroyImageView(dev.device, v, nullptr);
-    t.levels.clear();
     if (t.view) vkDestroyImageView(dev.device, t.view, nullptr);
     if (t.image) mkwvk::destroy_image(t.image, t.memory);
     t = Image{};
 }
 
-/// One of the SDK's internal images: storage and sampled, GENERAL throughout, with a view per level
-/// when it has more than one (the pyramids bind their levels separately).
+/// An image let go: destroyed a few presents on, as work recorded with it may still be in flight
+void drop_image(Image& t) {
+    if (t.image) g.dead.push_back({texture_frame_no(), std::move(t)});
+    t = Image{};
+}
+
+void free_dead() {
+    const uint64_t now = texture_frame_no();
+    for (size_t i = 0; i < g.dead.size();) {
+        if (now - g.dead[i].first > 4) {
+            destroy_now(g.dead[i].second);
+            g.dead[i] = std::move(g.dead.back());
+            g.dead.pop_back();
+        } else {
+            i++;
+        }
+    }
+}
+
+/// One of the SDK's internal images: storage and sampled, GENERAL throughout, with a view per level when it has more than
+/// one (the pyramids bind their levels separately).
 bool make_image(Image& t, VkFormat format, uint32_t width, uint32_t height, uint32_t levels = 1) {
     drop_image(t);
     t.format = format, t.width = std::max(1u, width), t.height = std::max(1u, height);
@@ -242,14 +242,11 @@ bool make_image(Image& t, VkFormat format, uint32_t width, uint32_t height, uint
     ci.arrayLayers = 1;
     ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-    // (TRANSFER_SRC as well as DST: the output is blitted from, which is how the seam gets it into
-    //  the game's target. Asking only for DST while blitting from it is a validation error waiting
-    //  on a device that checks; caught in review, not by a run)
-    ci.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-               VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    ci.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (!create_image(ci, t.image, t.memory, false)) {
         logf("vk: fsr3: a %ux%u image (format %d) was not made", t.width, t.height, (int)format);
+        t.image = VK_NULL_HANDLE;
         return false;
     }
     VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -257,7 +254,7 @@ bool make_image(Image& t, VkFormat format, uint32_t width, uint32_t height, uint
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vi.format = format;
     vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, t.level_count, 0, 1};
-    if (vkCreateImageView(dev.device, &vi, nullptr, &t.view) != VK_SUCCESS) return false;
+    if (vkCreateImageView(dev.device, &vi, nullptr, &t.view) != VK_SUCCESS) return t.view = VK_NULL_HANDLE, false;
     if (t.level_count > 1) {
         for (uint32_t level = 0; level < t.level_count; level++) {
             vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1, 0, 1};
@@ -273,7 +270,7 @@ bool make_pipeline(Pipeline& p, const PassInfo& info) {
     std::vector<VkDescriptorSetLayoutBinding> bindings;
     bindings.reserve(info.binding_count + 2);
     for (size_t i = 0; i < info.binding_count; i++) {
-        const VkDescriptorType type = info.bindings[i] == T ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+        const VkDescriptorType type = info.bindings[i] == T   ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
                                       : info.bindings[i] == I ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
                                                               : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         bindings.push_back({(uint32_t)i, type, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
@@ -295,8 +292,8 @@ bool make_pipeline(Pipeline& p, const PassInfo& info) {
     VkShaderModule m = VK_NULL_HANDLE;
     if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
     VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
-                VK_SHADER_STAGE_COMPUTE_BIT, m, "main", nullptr};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main",
+                nullptr};
     ci.layout = p.layout;
     const VkResult made = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &p.pipeline);
     vkDestroyShaderModule(dev.device, m, nullptr);
@@ -320,44 +317,43 @@ bool make_samplers() {
     return vkCreateSampler(dev.device, &si, nullptr, &g.linear) == VK_SUCCESS;
 }
 
-/// Every storage format the internal images need. A device missing one cannot run the passes, and
-/// finding that out here is better than a failed image allocation in the middle of a frame.
+/// Every storage format the internal images need. A device missing one cannot run the passes, and finding that out here is
+/// better than a failed image allocation in the middle of a frame.
 bool formats_supported() {
     static const VkFormat needed[]{
-        VK_FORMAT_R8_UNORM,          VK_FORMAT_R16_SFLOAT,       VK_FORMAT_R8G8B8A8_UNORM,
-        VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16_SFLOAT,  VK_FORMAT_R32_SFLOAT,
-        VK_FORMAT_R32_UINT,          VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R16_SNORM,
+        VK_FORMAT_R8_UNORM,      VK_FORMAT_R16_SFLOAT, VK_FORMAT_R8G8B8A8_UNORM,      VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_UINT, VK_FORMAT_R32G32B32A32_SFLOAT,
+        VK_FORMAT_R16_SNORM,
     };
     for (VkFormat f : needed) {
         VkFormatProperties props{};
         vkGetPhysicalDeviceFormatProperties(dev.physical, f, &props);
         if (!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ||
             !(props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
-            logf("vk: fsr3: format %d cannot be a storage and sampled image here", (int)f);
+            logf("vk: fsr3: not on this GPU: format %d cannot be a storage and sampled image here", (int)f);
             return false;
         }
     }
     return true;
 }
 
-/// The uniform buffer the three constant blocks are written into: host visible and mapped, with a
-/// set of slots per frame in flight so writing one frame cannot disturb a frame still being read.
+/// The uniform buffer the two constant blocks (and the Lanczos table, once) are written into: host visible and mapped, with
+/// a set of slots per frame in flight so writing one frame cannot disturb a frame still being read.
 bool make_uniforms() {
     const VkDeviceSize align = std::max<VkDeviceSize>(dev.props.limits.minUniformBufferOffsetAlignment, 16);
     const auto round_up = [align](VkDeviceSize n) { return (n + align - 1) / align * align; };
     g.slot_fsr = round_up(sizeof(Constants));
     g.slot_spd = round_up(sizeof(SpdConstants));
-    g.slot_rcas = round_up(sizeof(RcasConstants));
-    g.frame_stride = g.slot_fsr + g.slot_spd + g.slot_rcas + round_up(128 * sizeof(int16_t));
-    return create_buffer(g.frame_stride * kUniformFrames,
-                         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true,
-                         g.uniforms, g.uniforms_memory, &g.uniforms_mapped);
+    g.frame_stride = g.slot_fsr + g.slot_spd + round_up(128 * sizeof(int16_t));
+    return create_buffer(g.frame_stride * kUniformFrames, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                         true, g.uniforms, g.uniforms_memory, &g.uniforms_mapped);
 }
 
-/// Records one pass: its descriptors pushed in the order the pass file numbers them, then the two
-/// samplers it declares at 1000 and 1001, then the dispatch.
-void record_pass(VkCommandBuffer cmd, const Pipeline& p, const PassInfo& info, const Resource* res,
-                 size_t count, uint32_t groups_x, uint32_t groups_y) {
+/// Records one pass: its descriptors pushed in the order the pass file numbers them, then the two samplers it declares at
+/// 1000 and 1001, then the dispatch, and a barrier after it (every pass reads what the one before it wrote).
+void record_pass(VkCommandBuffer cmd, size_t pass, const Resource* res, size_t count, uint32_t groups_x, uint32_t groups_y) {
+    const PassInfo& info = PASSES[pass];
+    const Pipeline& p = g.passes[pass];
     std::vector<VkDescriptorImageInfo> images(count);
     std::vector<VkDescriptorBufferInfo> buffers(count);
     std::vector<VkWriteDescriptorSet> writes;
@@ -372,17 +368,15 @@ void record_pass(VkCommandBuffer cmd, const Pipeline& p, const PassInfo& info, c
             w.pBufferInfo = &buffers[i];
         } else {
             images[i] = {VK_NULL_HANDLE, res[i].view, VK_IMAGE_LAYOUT_GENERAL};
-            w.descriptorType = info.bindings[i] == T ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
-                                                     : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            w.descriptorType = info.bindings[i] == T ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             w.pImageInfo = &images[i];
         }
         writes.push_back(w);
     }
     const VkDescriptorImageInfo point{g.point, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
     const VkDescriptorImageInfo linear{g.linear, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
-    for (const auto& [binding, info_ptr] :
-         {std::pair<uint32_t, const VkDescriptorImageInfo*>{1000, &point},
-          std::pair<uint32_t, const VkDescriptorImageInfo*>{1001, &linear}}) {
+    for (const auto& [binding, info_ptr] : {std::pair<uint32_t, const VkDescriptorImageInfo*>{1000, &point},
+                                           std::pair<uint32_t, const VkDescriptorImageInfo*>{1001, &linear}}) {
         VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w.dstBinding = binding;
         w.descriptorCount = 1;
@@ -390,50 +384,46 @@ void record_pass(VkCommandBuffer cmd, const Pipeline& p, const PassInfo& info, c
         w.pImageInfo = info_ptr;
         writes.push_back(w);
     }
-    // (one timed span per pass with RX_VK_PASS_TIMING=1, so the profiler's report gives GPU ms by
-    //  pass name. Nine passes costing half a second between them needs a number per pass, not
-    //  another hypothesis)
-    // (hookshot, diagnostics) RX_VK_FSR_STAGE cuts this path short so each run names a cost
-    //  instead of a hypothesis: 2 records every barrier, clear and descriptor but no dispatch.
-    const bool timed = gprof_begin(cmd);
+    const bool timed = gprof_begin(cmd);   // (RX_VK_PASS_TIMING=1: GPU ms by pass name)
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
-    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0,
-                              (uint32_t)writes.size(), writes.data());
-    if (fsr_stage() != 2) vkCmdDispatch(cmd, std::max(1u, groups_x), std::max(1u, groups_y), 1);
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, (uint32_t)writes.size(), writes.data());
+    vkCmdDispatch(cmd, std::max(1u, groups_x), std::max(1u, groups_y), 1);
     if (timed) gprof_end(cmd, std::string("fsr3 ") + info.name);
-    // (every pass reads what the one before it wrote)
     memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
-                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                   VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
 }
 
-} // namespace
-
-bool supported() {
-    static const bool answer = [] {
-        if (!dev.push_descriptor || !vkCmdPushDescriptorSetKHR) {
-            logf("vk: fsr3: no push descriptors");
-            return false;
-        }
-        return formats_supported();
-    }();
-    return answer;
+std::vector<Image*> all_images() {
+    std::vector<Image*> all{&g.farthest_depth, &g.shading_change, &g.new_locks, &g.spd_mips, &g.farthest_depth_mip1,
+                            &g.dilated_motion_vectors, &g.dilated_depth, &g.previous_nearest_depth,
+                            &g.dilated_reactive_masks, &g.frame_info, &g.spd_atomic, &g.lanczos_lut, &g.default_reactive,
+                            &g.output};
+    for (size_t i = 0; i < 2; i++) {
+        all.push_back(&g.accumulation[i]);
+        all.push_back(&g.luma[i]);
+        all.push_back(&g.luma_history[i]);
+        all.push_back(&g.internal_upscaled[i]);
+    }
+    return all;
 }
 
-bool prepare(uint32_t render_width, uint32_t render_height, uint32_t upscale_width,
-             uint32_t upscale_height) {
+/// The pipelines and the internal images for an evaluation at these sizes, made again when the sizes change
+bool prepare(uint32_t render_width, uint32_t render_height, uint32_t upscale_width, uint32_t upscale_height) {
     if (!supported()) return false;
     if (!g.tried) {
         g.tried = true;
         g.ok = make_samplers() && make_uniforms();
-        for (size_t i = 0; i < kPassCount && g.ok; i++) g.ok = make_pipeline(g.passes[i], PASSES[i]);
-        if (g.ok) logf("vk: fsr3: %zu pass pipelines ready", kPassCount);
+        for (size_t i = 0; i < kPassCount && g.ok; i++) {
+            const bool needed = g.wave ? (i != P_LUMA_PYRAMID_NOWAVE && i != P_SHADING_CHANGE_PYRAMID_NOWAVE)
+                                       : (i != P_LUMA_PYRAMID && i != P_SHADING_CHANGE_PYRAMID);
+            if (needed) g.ok = make_pipeline(g.passes[i], PASSES[i]);
+        }
+        if (g.ok) logf("vk: fsr3: its passes are ready (%s subgroup operations)", g.wave ? "with" : "without");
     }
     if (!g.ok) return false;
-    const bool same = g.output.image && g.render_width == render_width &&
-                      g.render_height == render_height && g.upscale_width == upscale_width &&
-                      g.upscale_height == upscale_height;
-    if (same) return true;
+    if (g.output.image && g.render_width == render_width && g.render_height == render_height &&
+        g.upscale_width == upscale_width && g.upscale_height == upscale_height)
+        return true;
 
     const uint32_t rw = std::max(1u, render_width), rh = std::max(1u, render_height);
     const uint32_t uw = std::max(1u, upscale_width), uh = std::max(1u, upscale_height);
@@ -441,19 +431,17 @@ bool prepare(uint32_t render_width, uint32_t render_height, uint32_t upscale_wid
     for (size_t i = 0; i < 2 && made; i++) {
         made = made && make_image(g.accumulation[i], VK_FORMAT_R8_UNORM, rw, rh);
         made = made && make_image(g.luma[i], VK_FORMAT_R16_SFLOAT, rw, rh);
-        // (the pass files declare the luma history as rgba8; the SDK allocates RGBA16F, which a
-        // storage format qualifier does not match, so allocate what the shaders store)
+        // (the pass files declare the luma history as rgba8; the SDK allocates RGBA16F, which a storage format qualifier
+        // does not match, so this allocates what the shaders store)
         made = made && make_image(g.luma_history[i], VK_FORMAT_R8G8B8A8_UNORM, rw, rh);
         made = made && make_image(g.internal_upscaled[i], VK_FORMAT_R16G16B16A16_SFLOAT, uw, uh);
     }
     const uint32_t half_w = std::max(1u, rw / 2), half_h = std::max(1u, rh / 2);
-    const uint32_t spd_levels =
-        (uint32_t)std::floor(std::log2((float)std::max(half_w, half_h))) + 1;
+    const uint32_t spd_levels = (uint32_t)std::floor(std::log2((float)std::max(half_w, half_h))) + 1;
     made = made && make_image(g.farthest_depth, VK_FORMAT_R16_SFLOAT, rw, rh);
     made = made && make_image(g.shading_change, VK_FORMAT_R8_UNORM, half_w, half_h);
     made = made && make_image(g.new_locks, VK_FORMAT_R8_UNORM, uw, uh);
-    made = made && make_image(g.spd_mips, VK_FORMAT_R16G16_SFLOAT, half_w, half_h,
-                              std::max(spd_levels, kSpdStoredMips));
+    made = made && make_image(g.spd_mips, VK_FORMAT_R16G16_SFLOAT, half_w, half_h, std::max(spd_levels, kSpdStoredMips));
     made = made && make_image(g.farthest_depth_mip1, VK_FORMAT_R16_SFLOAT, half_w, half_h);
     made = made && make_image(g.dilated_motion_vectors, VK_FORMAT_R16G16_SFLOAT, rw, rh);
     made = made && make_image(g.dilated_depth, VK_FORMAT_R32_SFLOAT, rw, rh);
@@ -464,8 +452,12 @@ bool prepare(uint32_t render_width, uint32_t render_height, uint32_t upscale_wid
     made = made && make_image(g.lanczos_lut, VK_FORMAT_R16_SNORM, 128, 1);
     made = made && make_image(g.default_reactive, VK_FORMAT_R8_UNORM, 1, 1);
     made = made && make_image(g.output, VK_FORMAT_R16G16B16A16_SFLOAT, uw, uh);
+    g.first_evaluation = true;   // (new images: their first layout and cleared, the history from nothing)
+    g.lut_uploaded = false;
+    g.parity = 0;
     if (!made) {
-        shutdown();
+        for (Image* t : all_images()) drop_image(*t);
+        g.render_width = g.render_height = g.upscale_width = g.upscale_height = 0;
         return false;
     }
     g.render_width = rw, g.render_height = rh, g.upscale_width = uw, g.upscale_height = uh;
@@ -473,31 +465,36 @@ bool prepare(uint32_t render_width, uint32_t render_height, uint32_t upscale_wid
     return true;
 }
 
-// (hookshot, diagnostics) How far down this path a run goes, and how far apart the evaluations are.
-//  0 (default) is the whole path; 1 stops before it (vk_draw.cpp); 2 records everything but the nine
-//  dispatches; 3 keeps the dispatches and drops the blit (vk_draw.cpp). The interval is the frame
-//  time when the scene evaluates once a frame, so one line says whether a stage is the cost.
+} // namespace
 
-void note_frame() {
-    using clk = std::chrono::steady_clock;
-    static clk::time_point last{};
-    static double sum_ms = 0.0;
-    static int n = 0;
-    const clk::time_point now = clk::now();
-    if (last.time_since_epoch().count() != 0) {
-        sum_ms += std::chrono::duration<double, std::milli>(now - last).count();
-        if (++n == 30) {
-            logf("vk: fsr3 stage %d: %.1f ms between evaluations (%.1f a second)", fsr_stage(),
-                 sum_ms / n, 1000.0 * n / sum_ms);
-            sum_ms = 0.0, n = 0;
+bool supported() {
+    if (!dev.device) return false;   // (asked before the device is made, by the menu: not an answer to keep)
+    static const bool answer = [] {
+        // (the widest pass pushes thirteen descriptors and the two samplers)
+        if (!dev.push_descriptor || !vkCmdPushDescriptorSetKHR || dev.max_push_descriptors < 15) {
+            logf("vk: fsr3: not on this GPU: no push descriptors, or fewer than 15 (%u)", dev.max_push_descriptors);
+            return false;
         }
-    }
-    last = now;
+        if (!dev.features.shaderStorageImageExtendedFormats || !dev.features.shaderStorageImageWriteWithoutFormat) {
+            logf("vk: fsr3: not on this GPU: no extended storage image formats, or no storage writes without a format");
+            return false;
+        }
+        if (!formats_supported()) return false;
+        VkPhysicalDeviceSubgroupProperties sg{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &sg;
+        vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+        const VkSubgroupFeatureFlags want = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_QUAD_BIT;
+        g.wave = (sg.supportedOperations & want) == want && (sg.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT);
+        logf("vk: fsr3: AMD FSR 3.1 can run on this GPU");
+        return true;
+    }();
+    return answer;
 }
 
 bool upscale(VkCommandBuffer cmd, const Inputs& in) {
+    free_dead();
     if (!in.color || !in.depth || !in.motion) return false;
-    if (!(in.near_plane > 0.0f) || !(in.fov_y > 0.0f)) return false;   // (Inputs defaults them)
     if (!prepare(in.render_width, in.render_height, in.upscale_width, in.upscale_height)) return false;
 
     const bool first = g.first_evaluation;
@@ -517,30 +514,19 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
         k.jitter[i] = in.jitter[i];
         k.previous_jitter[i] = first ? in.jitter[i] : g.previous_jitter[i];
     }
-    {   // (setupDeviceDepthToViewSpaceDepthParams for reversed infinite depth)
-        const float aspect = (float)rw / (float)std::max(1, rh);
-        const float cot_half_fov = std::cos(0.5f * in.fov_y) / std::sin(0.5f * in.fov_y);
-        k.device_to_view_depth[0] = -1.0f * FLT_EPSILON;
-        k.device_to_view_depth[1] = in.near_plane;
-        k.device_to_view_depth[2] = 1.0f / (cot_half_fov / aspect);
-        k.device_to_view_depth[3] = 1.0f / cot_half_fov;
-        k.tan_half_fov = std::tan(std::atan(std::tan(in.fov_y * 0.5f) * aspect));
-    }
+    memcpy(k.device_to_view_depth, in.camera.device_to_view_depth, sizeof k.device_to_view_depth);
+    k.tan_half_fov = in.camera.tan_half_fov_x;   // (not read by the 3.1.4 upscaler's passes; set as the SDK sets it)
     k.motion_vector_scale[0] = in.motion_scale[0] / (float)std::max(1, rw);
     k.motion_vector_scale[1] = in.motion_scale[1] / (float)std::max(1, rh);
     k.downscale_factor[0] = (float)rw / (float)std::max(1, uw);
     k.downscale_factor[1] = (float)rh / (float)std::max(1, uh);
-    const float phases = (float)jitter_phase_count_for(g.render_width, g.upscale_width);
-    if (reset || g.jitter_phase_count == 0.0f) g.jitter_phase_count = phases;
-    else if (phases > g.jitter_phase_count) g.jitter_phase_count += 1.0f;
-    else if (phases < g.jitter_phase_count) g.jitter_phase_count -= 1.0f;
-    k.jitter_phase_count = g.jitter_phase_count;
+    k.jitter_phase_count = (float)std::max(1u, in.jitter_phases);
     k.delta_time = std::clamp(in.frame_time_ms / 1000.0f, 0.0f, 1.0f);
     k.delta_pre_exposure = 1.0f;
     k.view_space_to_meters = 1.0f;
     g.frame_index = reset ? 0.0f : g.frame_index + 1.0f;
     k.frame_index = g.frame_index;
-    k.velocity_factor = 1.0f;             // (the SDK's FFX_FSR3UPSCALER_CONFIGURE_UPSCALE_KEY_* defaults)
+    k.velocity_factor = 1.0f;   // (the SDK's FFX_FSR3UPSCALER_CONFIGURE_UPSCALE_KEY_* defaults)
     k.reactiveness_scale = 1.0f;
     k.shading_change_scale = 1.0f;
     k.accumulation_added_per_frame = 1.0f / 3.0f;
@@ -557,8 +543,6 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
     spd.mips = (uint32_t)std::min(std::floor(std::log2((float)std::max(g.render_width, g.render_height))), 12.0f);
     spd.num_work_groups = spd_x * spd_y;
     spd.render_size[0] = g.render_width, spd.render_size[1] = g.render_height;
-    RcasConstants rcas{};
-    rcas_con(rcas.config, 2.0f - 2.0f * std::clamp(in.sharpness, 0.0f, 1.0f));
 
     // This frame's slots, written through the mapped buffer.
     const VkDeviceSize base = (VkDeviceSize)(g.uniform_frame % kUniformFrames) * g.frame_stride;
@@ -566,16 +550,13 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
     uint8_t* const mapped = (uint8_t*)g.uniforms_mapped + base;
     memcpy(mapped, &k, sizeof k);
     memcpy(mapped + g.slot_fsr, &spd, sizeof spd);
-    memcpy(mapped + g.slot_fsr + g.slot_spd, &rcas, sizeof rcas);
-    const VkDeviceSize lut_at = g.slot_fsr + g.slot_spd + g.slot_rcas;
+    const VkDeviceSize lut_at = g.slot_fsr + g.slot_spd;
     if (!g.lut_uploaded) {   // (the accumulate pass's Lanczos weights, 128 taps as the SDK builds them)
         int16_t weights[128];
         for (size_t i = 0; i < 128; i++) {
             const float x = 2.0f * (float)i / 127.0f;
             const float pi_x = 3.14159265358979f * x;
-            const float y = std::abs(x) < FLT_EPSILON
-                                ? 1.0f
-                                : (std::sin(pi_x) / pi_x) * (std::sin(0.5f * pi_x) / (0.5f * pi_x));
+            const float y = std::abs(x) < FLT_EPSILON ? 1.0f : (std::sin(pi_x) / pi_x) * (std::sin(0.5f * pi_x) / (0.5f * pi_x));
             weights[i] = (int16_t)std::lround(y * 32767.0f);
         }
         memcpy(mapped + lut_at, weights, sizeof weights);
@@ -584,26 +565,13 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
 
     const uint32_t p = g.parity, q = p ^ 1u;
 
-    // What the game's draws wrote has to be visible, and our images need their first layout.
-    {
-        memory_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                       VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
-                           VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
-                           VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                       VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                       VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
-                           VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    }
-    std::vector<Image*> all{&g.farthest_depth, &g.shading_change, &g.new_locks, &g.spd_mips,
-                            &g.farthest_depth_mip1, &g.dilated_motion_vectors, &g.dilated_depth,
-                            &g.previous_nearest_depth, &g.dilated_reactive_masks, &g.frame_info,
-                            &g.spd_atomic, &g.lanczos_lut, &g.default_reactive, &g.output};
-    for (size_t i = 0; i < 2; i++) {
-        all.push_back(&g.accumulation[i]);
-        all.push_back(&g.luma[i]);
-        all.push_back(&g.luma_history[i]);
-        all.push_back(&g.internal_upscaled[i]);
-    }
+    // What was written before (the inputs: vk_fsr3_inputs.cpp) has to be visible, and new images need their first layout.
+    memory_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                   VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                       VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                   VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                   VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    const std::vector<Image*> all = all_images();
     if (first) {
         std::vector<VkImageMemoryBarrier2> to_general;
         to_general.reserve(all.size());
@@ -624,9 +592,7 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
         di.pImageMemoryBarriers = to_general.data();
         vkCmdPipelineBarrier2(cmd, &di);
         const VkClearColorValue zero{};
-        for (const Image* t : all) {
-            vkCmdClearColorImage(cmd, t->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &ALL_LEVELS);
-        }
+        for (const Image* t : all) vkCmdClearColorImage(cmd, t->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &ALL_LEVELS);
     }
     if (!g.lut_uploaded) {
         g.lut_uploaded = true;
@@ -638,20 +604,16 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
     }
     // Per frame: the nearest-depth scratch, the SPD counter and its mips; the history on a reset.
     const VkClearColorValue zero{};
-    for (const Image* t : {&g.previous_nearest_depth, &g.spd_atomic, &g.spd_mips}) {
+    for (const Image* t : {&g.previous_nearest_depth, &g.spd_atomic, &g.spd_mips})
         vkCmdClearColorImage(cmd, t->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &ALL_LEVELS);
-    }
     if (reset) {
         vkCmdClearColorImage(cmd, g.accumulation[p].image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &ALL_LEVELS);
         VkClearColorValue info{};
         info.float32[0] = -1.0f, info.float32[1] = 1.0f;
         vkCmdClearColorImage(cmd, g.frame_info.image, VK_IMAGE_LAYOUT_GENERAL, &info, 1, &ALL_LEVELS);
     }
-    {
-        memory_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                       VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
-    }
+    memory_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                   VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
 
     const auto tex = [](const Image& t) { return Resource{t.view}; };
     const auto mip = [](uint32_t level) {
@@ -663,91 +625,216 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
     const Resource current_luma = tex(g.luma[p]);
     const Resource cb_fsr{VK_NULL_HANDLE, g.uniforms, base, g.slot_fsr};
     const Resource cb_spd{VK_NULL_HANDLE, g.uniforms, base + g.slot_fsr, g.slot_spd};
-    const Resource cb_rcas{VK_NULL_HANDLE, g.uniforms, base + g.slot_fsr + g.slot_spd, g.slot_rcas};
-    const auto groups = [](int32_t size, uint32_t tile) {
-        return ((uint32_t)std::max(1, size) + tile - 1) / tile;
-    };
+    const auto groups = [](int32_t size, uint32_t tile) { return ((uint32_t)std::max(1, size) + tile - 1) / tile; };
     const auto run = [&](size_t pass, std::initializer_list<Resource> res, uint32_t gx, uint32_t gy) {
-        record_pass(cmd, g.passes[pass], PASSES[pass], res.begin(), res.size(), gx, gy);
+        record_pass(cmd, pass, res.begin(), res.size(), gx, gy);
     };
 
-    run(0, {motion, depth, color, tex(g.dilated_motion_vectors), tex(g.dilated_depth),
-            tex(g.previous_nearest_depth), tex(g.farthest_depth), current_luma, cb_fsr},
+    run(P_PREPARE_INPUTS, {motion, depth, color, tex(g.dilated_motion_vectors), tex(g.dilated_depth),
+                           tex(g.previous_nearest_depth), tex(g.farthest_depth), current_luma, cb_fsr},
         groups(rw, 8), groups(rh, 8));
-    run(1, {current_luma, tex(g.farthest_depth), tex(g.spd_atomic), tex(g.frame_info), mip(0), mip(1),
-            mip(2), mip(3), mip(4), mip(5), tex(g.farthest_depth_mip1), cb_fsr, cb_spd},
+    run(g.wave ? P_LUMA_PYRAMID : P_LUMA_PYRAMID_NOWAVE,
+        {current_luma, tex(g.farthest_depth), tex(g.spd_atomic), tex(g.frame_info), mip(0), mip(1), mip(2), mip(3), mip(4),
+         mip(5), tex(g.farthest_depth_mip1), cb_fsr, cb_spd},
         spd_x, spd_y);
-    // (hookshot) The two pyramid passes share one atomic counter, and the single-pass downsampler
-    // uses it to elect the workgroup that finishes the chain: it counts up to num_work_groups and
-    // the last one through does the tail. Clearing it only once a frame leaves the second pass
-    // starting at the total, so no workgroup is elected and the ones waiting on the tail spin. One
-    // FSR evaluation cost about half a second before this, with the frame rate falling to 1.9 fps.
-    {
-        const VkClearColorValue zero_again{};
-        memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
-                       VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-        vkCmdClearColorImage(cmd, g.spd_atomic.image, VK_IMAGE_LAYOUT_GENERAL, &zero_again, 1, &ALL_LEVELS);
-        memory_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                       VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
-    }
-    run(3, {current_luma, tex(g.luma[q]), tex(g.dilated_motion_vectors), exposure, tex(g.spd_atomic),
-            mip(0), mip(1), mip(2), mip(3), mip(4), mip(5), cb_fsr, cb_spd},
+    // The two pyramid passes share one atomic counter, and the single-pass downsampler uses it to elect the workgroup that
+    // finishes the chain: it counts up to num_work_groups and the last one through does the tail. Cleared only once a frame,
+    // the second pass would start at the total, elect no workgroup, and the ones waiting on the tail would spin
+    memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                   VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    vkCmdClearColorImage(cmd, g.spd_atomic.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &ALL_LEVELS);
+    memory_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                   VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+    run(g.wave ? P_SHADING_CHANGE_PYRAMID : P_SHADING_CHANGE_PYRAMID_NOWAVE,
+        {current_luma, tex(g.luma[q]), tex(g.dilated_motion_vectors), exposure, tex(g.spd_atomic), mip(0), mip(1), mip(2),
+         mip(3), mip(4), mip(5), cb_fsr, cb_spd},
         spd_x, spd_y);
-    run(5, {tex(g.spd_mips), tex(g.shading_change), cb_fsr}, groups(rw / 2, 8), groups(rh / 2, 8));
-    run(6, {tex(g.previous_nearest_depth), tex(g.dilated_motion_vectors), tex(g.dilated_depth),
-            tex(g.default_reactive), tex(g.default_reactive), tex(g.accumulation[p]),
-            tex(g.shading_change), current_luma, exposure, tex(g.dilated_reactive_masks),
-            tex(g.new_locks), tex(g.accumulation[q]), cb_fsr},
+    run(P_SHADING_CHANGE, {tex(g.spd_mips), tex(g.shading_change), cb_fsr}, groups(rw / 2, 8), groups(rh / 2, 8));
+    run(P_PREPARE_REACTIVITY,
+        {tex(g.previous_nearest_depth), tex(g.dilated_motion_vectors), tex(g.dilated_depth), tex(g.default_reactive),
+         tex(g.default_reactive), tex(g.accumulation[p]), tex(g.shading_change), current_luma, exposure,
+         tex(g.dilated_reactive_masks), tex(g.new_locks), tex(g.accumulation[q]), cb_fsr},
         groups(rw, 8), groups(rh, 8));
-    run(7, {exposure, tex(g.dilated_reactive_masks), tex(g.dilated_motion_vectors), tex(g.frame_info),
-            tex(g.luma_history[p]), tex(g.farthest_depth_mip1), current_luma, tex(g.luma_history[q]),
-            tex(g.farthest_depth), cb_fsr},
+    run(P_LUMA_INSTABILITY,
+        {exposure, tex(g.dilated_reactive_masks), tex(g.dilated_motion_vectors), tex(g.frame_info), tex(g.luma_history[p]),
+         tex(g.farthest_depth_mip1), current_luma, tex(g.luma_history[q]), tex(g.farthest_depth), cb_fsr},
         groups(rw, 8), groups(rh, 8));
-    run(in.sharpen ? 9 : 8,
-        {exposure, tex(g.dilated_reactive_masks), tex(g.dilated_motion_vectors),
-         tex(g.internal_upscaled[p]), tex(g.lanczos_lut), tex(g.farthest_depth_mip1), current_luma,
-         tex(g.farthest_depth), color, tex(g.internal_upscaled[q]), tex(g.output), tex(g.new_locks),
-         cb_fsr},
+    run(P_ACCUMULATE,
+        {exposure, tex(g.dilated_reactive_masks), tex(g.dilated_motion_vectors), tex(g.internal_upscaled[p]),
+         tex(g.lanczos_lut), tex(g.farthest_depth_mip1), current_luma, tex(g.farthest_depth), color,
+         tex(g.internal_upscaled[q]), tex(g.output), tex(g.new_locks), cb_fsr},
         groups(uw, 8), groups(uh, 8));
-    if (in.sharpen) {
-        run(10, {exposure, tex(g.internal_upscaled[q]), tex(g.output), cb_fsr, cb_rcas},
-            groups(uw, 16), groups(uh, 16));
-    }
-    {
-        memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
-                       VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                       VK_ACCESS_2_SHADER_READ_BIT);
-    }
     g.parity = q;
     return true;
 }
 
-VkImage output_image() {
-    return g.output.image;
-}
-
-VkImageView output_view() {
-    return g.output.view;
-}
-
-void shutdown() {
-    for (Image* t : {&g.farthest_depth, &g.shading_change, &g.new_locks, &g.spd_mips,
-                     &g.farthest_depth_mip1, &g.dilated_motion_vectors, &g.dilated_depth,
-                     &g.previous_nearest_depth, &g.dilated_reactive_masks, &g.frame_info,
-                     &g.spd_atomic, &g.lanczos_lut, &g.default_reactive, &g.output}) {
-        drop_image(*t);
-    }
-    for (size_t i = 0; i < 2; i++) {
-        drop_image(g.accumulation[i]);
-        drop_image(g.luma[i]);
-        drop_image(g.luma_history[i]);
-        drop_image(g.internal_upscaled[i]);
-    }
-    g.render_width = g.render_height = g.upscale_width = g.upscale_height = 0;
-    g.first_evaluation = true;
-    g.lut_uploaded = false;
-    g.parity = 0;
-}
+VkImage output_image() { return g.output.image; }
+VkImageView output_view() { return g.output.view; }
 
 } // namespace mkwvk::fsr3
+
+namespace mkwvk {
+
+namespace {
+
+int env_switch(const char* name) {   // (-1: unset)
+    const char* e = getenv(name);
+    return e && *e ? atoi(e) : -1;
+}
+
+/// The network's output from FSR's picture: dlss_out.comp, the same pass DLSS's picture goes through (the colour FSR was
+/// given is the network's perceptual encoding, which this squares back to linear colour, as the network's own output does)
+struct Out {
+    std::mutex mu;
+    bool tried = false;
+    VkDescriptorSetLayout set = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    VkSampler point = VK_NULL_HANDLE;
+    const char* reason = nullptr;
+    int reason_repeats = 0;
+    bool told_first = false;
+    uint64_t drawn = 0;
+};
+Out& out_state() {
+    static Out o;
+    return o;
+}
+
+bool make_out_pipeline() {
+    Out& o = out_state();
+    if (o.pipe) return true;
+    if (o.tried) return false;
+    o.tried = true;
+    const VkDescriptorSetLayoutBinding b[2] = {
+        {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+    VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    li.bindingCount = 2, li.pBindings = b;
+    if (vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &o.set) != VK_SUCCESS) return false;
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+    VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pi.setLayoutCount = 1, pi.pSetLayouts = &o.set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
+    if (vkCreatePipelineLayout(dev.device, &pi, nullptr, &o.layout) != VK_SUCCESS) return false;
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize = sizeof DLSS_OUT_COMP_SPV, mi.pCode = DLSS_OUT_COMP_SPV;
+    VkShaderModule m = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main",
+                nullptr};
+    ci.layout = o.layout;
+    const VkResult r = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &o.pipe);
+    vkDestroyShaderModule(dev.device, m, nullptr);
+    if (r != VK_SUCCESS) return o.pipe = VK_NULL_HANDLE, false;
+    VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    si.magFilter = si.minFilter = VK_FILTER_NEAREST;
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (vkCreateSampler(dev.device, &si, nullptr, &o.point) != VK_SUCCESS) {
+        vkDestroyPipeline(dev.device, o.pipe, nullptr);
+        return o.pipe = VK_NULL_HANDLE, false;
+    }
+    return true;
+}
+
+bool fail(const char* why) {   // (the network runs: why, when it changes and every 600th time)
+    Out& o = out_state();
+    if (why != o.reason || ++o.reason_repeats % 600 == 0) logf("vk: fsr3: the game's upscale runs (%s)", why);
+    if (why != o.reason) o.reason = why, o.reason_repeats = 0;
+    return false;
+}
+
+} // namespace
+
+bool fsr3_wanted() {
+    static const int env = env_switch("RX_VK_FSR");
+    if (env == 0) return false;
+    // (the Upscaler row's FSR 3.1, upscaler_rows.h, read each time: the row changes it while the game runs)
+    return (env > 0 || opts.dlss == upscaler_rows::FSR3) && fsr3::supported();
+}
+
+bool fsr3_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, VkImageView in_view, Texture* out,
+                  VkImageView out_view, uint32_t out_level) {
+    const bool upscaling = fsr3_wanted();
+    // (hookshot fork) AMD FSR 4 through AMD's runtime (vk_ffx.h), the Upscaler row's value after FSR 3.1: the same inputs,
+    // its picture squared back by the same pass
+    const bool fsr4 = !upscaling && fsr4_wanted();
+    if (!upscaling && !fsr4 && !fsr3_inputs::wanted()) return false;
+    if (!in || !in_view || !out || !out_view) return false;
+    // (another network of the upscale's shape, as dlss_upscale takes them: only the scene into the picture. The gameplay
+    // networks sample the scene's B10G11R11 colour and write the B10G11R11 picture)
+    if (!known && (in->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || out->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
+                   (out->width >> out_level) <= in->width || !fsr3_inputs::is_scene(in)))
+        return false;
+    fsr3_inputs::Frame f;
+    if (!fsr3_inputs::prepare(cmd, in, in_view, f)) return upscaling || fsr4 ? fail("its inputs could not be made") : false;
+    if (!upscaling && !fsr4) return false;   // (frame interpolation's inputs alone: the network or DLSS upscales)
+    Out& o = out_state();
+    std::lock_guard lk(o.mu);
+    const uint32_t ow = std::max(1u, out->width >> out_level), oh = std::max(1u, out->height >> out_level);
+    if (out->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || ow < f.width || oh < f.height) return fail("unexpected output");
+    if (!make_out_pipeline()) return fail("its output pass was not made");
+    struct Disturbed {   // (from here commands are recorded: the program's descriptor pushes are pushed again after)
+        ~Disturbed() { descriptors_disturbed(); }
+    } disturbed;
+    fsr3::Inputs ai;
+    ai.color = f.color, ai.depth = f.depth, ai.motion = f.motion;
+    ai.render_width = f.width, ai.render_height = f.height;
+    ai.upscale_width = ow, ai.upscale_height = oh;
+    ai.jitter[0] = f.jitter[0], ai.jitter[1] = f.jitter[1];
+    ai.jitter_phases = fsr3_inputs::jitter_size(2) ? fsr3_inputs::jitter_size(2) : 8;
+    ai.camera = f.camera;
+    ai.frame_time_ms = f.frame_ms;
+    ai.reset = f.reset;
+    VkImageView picture = VK_NULL_HANDLE;
+    if (fsr4) {   // (hookshot fork: the same inputs as whole images, AMD's runtime's flags matching them: vk_ffx.cpp)
+        ffx::UpscaleInputs xi;
+        xi.color = f.color_image, xi.color_format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        xi.depth = f.depth_image, xi.depth_format = VK_FORMAT_R32_SFLOAT;
+        xi.motion = f.motion_image, xi.motion_format = VK_FORMAT_R16G16_SFLOAT;
+        xi.render_width = f.width, xi.render_height = f.height;
+        xi.upscale_width = ow, xi.upscale_height = oh;
+        xi.jitter[0] = f.jitter[0], xi.jitter[1] = f.jitter[1];
+        xi.near_plane = f.camera.near_plane, xi.far_plane = f.camera.far_plane, xi.fov_y = f.camera.fov_y;
+        xi.frame_time_ms = f.frame_ms;
+        xi.reset = f.reset;
+        if (!ffx::upscale(cmd, xi) || !ffx::output_view()) return fail("AMD's FSR 4 runtime did not upscale");
+        picture = ffx::output_view();
+    } else {
+        if (!fsr3::upscale(cmd, ai)) return fail("its passes could not be recorded");
+        picture = fsr3::output_view();
+    }
+    {
+        const int32_t pc[2] = {(int32_t)ow, (int32_t)oh};
+        const VkDescriptorImageInfo info[2] = {{o.point, picture, VK_IMAGE_LAYOUT_GENERAL},
+                                               {VK_NULL_HANDLE, out_view, VK_IMAGE_LAYOUT_GENERAL}};
+        VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+        w[0].dstBinding = 0, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w[0].pImageInfo = &info[0];
+        w[1].dstBinding = 1, w[1].descriptorCount = 1, w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w[1].pImageInfo = &info[1];
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, o.pipe);
+        vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, o.layout, 0, 2, w);
+        vkCmdPushConstants(cmd, o.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+        vkCmdDispatch(cmd, (ow + 7) / 8, (oh + 7) / 8, 1);
+    }
+    full_barrier(cmd);
+    fsr3_inputs::upscaled(f.width, f.height, ow, oh);
+    // (every 600 frames: that it still draws, and the jitter it was given, which says the host's jitter is on)
+    if (++o.drawn % 600 == 0)
+        logf("vk: fsr3: %llu frames drawn, %ux%u -> %ux%u, this one's jitter %+.3f %+.3f px of %u phases", (unsigned long long)o.drawn,
+             f.width, f.height, ow, oh, f.jitter[0], f.jitter[1], ai.jitter_phases);
+    if (o.reason) logf("vk: fsr3: FSR 3.1 draws the upscale again (frame %llu)", (unsigned long long)f.frame);
+    o.reason = nullptr;
+    if (!o.told_first) {
+        o.told_first = true;
+        logf("vk: %s %ux%u -> %ux%u with assembled depth and camera motion (network %016llx; jitter %+.3f %+.3f px, "
+             "%u phases)",
+             fsr4 ? "amd fsr 4" : "fsr3", f.width, f.height, ow, oh, (unsigned long long)key, f.jitter[0], f.jitter[1],
+             ai.jitter_phases);
+    }
+    return true;
+}
+
+} // namespace mkwvk

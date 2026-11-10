@@ -199,7 +199,8 @@ const char* hn_upscaler(int v, int variant) {
         "themselves can trail for now.",
         "NVIDIA's, the 3D at full size with its edges smoothed; the slowest. Softer than the game's own: set Sharpness to "
         "around 80%. Things that move by themselves can trail for now.",
-        "AMD's, from a smaller 3D, on any GPU: built from AMD's own shaders. Things that move by themselves can trail.",
+        "AMD's, from a smaller 3D, on any GPU: built from AMD's own shaders. Things that move by themselves can trail for "
+        "now.",
         "AMD's machine-learning upscaler, from a smaller 3D: Windows, with AMD's runtime beside the game. On an RX 9000 it "
         "is FSR 4; elsewhere AMD's runtime picks what that GPU runs.",
     };
@@ -486,8 +487,17 @@ MENU_HINTS(hn_preset, 0, "Each row as you set it. Changing most rows yourself co
            "Resolution 100% (with DLSS its nearest mode), Lanczos, Sharpness 30%, 2x frames.",
            "Resolution 100% (with DLSS its nearest mode), Lanczos, Sharpness 40%, 3x frames.")
 MENU_HINTS(hn_gpu, 0, "The best dedicated GPU.")
+unsigned framegen_available();
 /// Frame generation: how many frames are made for each of the game's
 const char* hn_framegen(int v, int variant) {
+    // (2x: by AMD FSR 3.1 where it runs, from the scene's depth and motion: vk_framegen.cpp. Variant 1 is that text.
+    // hookshot fork: where FSR 3.1 is the method that makes the frame, framegen_methods.h first)
+    namespace fgm = framegen_methods;
+    if (v == 2 && (variant < 0 ? fsr3fi::frames_wanted() != 0 &&
+                                     fgm::first(fgm::effective(opts.framegen_method, framegen_available()),
+                                                framegen_available(), 2) == fgm::FSR3
+                               : variant == 1))
+        return "One made frame between each two of the game's, by AMD FSR 3.1 from the scene's depth and motion.";
     if (variant > 0) return nullptr;
     if (v <= 0) return "Only the game's own frames: no added delay.";
     if (v == 1) return "A frame for each of the display's refreshes: none made when the game keeps up. Frame pacing does not apply.";
@@ -503,7 +513,7 @@ unsigned framegen_available() {
     unsigned m = fgm::always();
     if (dlssg::supported()) m |= fgm::bit(fgm::DLSS);
     if (ffx::frames_supported()) m |= fgm::bit(fgm::FSR4);
-    if (fsr3fi::supported()) m |= fgm::bit(fgm::FSR3);
+    if (fsr3fi::capable()) m |= fgm::bit(fgm::FSR3);
     return m;
 }
 const char* tx_framegen_method(int v) {
@@ -515,7 +525,8 @@ const char* hn_framegen_method(int v, int variant) {
         "The best that runs here: DLSS, then FSR 4, then FSR 3.1, then the built-in blend. The log says which.",
         "NVIDIA's network, from the game's depth and motion: RTX 40 and 50, with nvngx_dlssg.dll in the game's ngx folder.",
         "AMD's FSR 4 frame generation, through AMD's runtime beside the game: Windows.",
-        "AMD's FSR 3.1 frame generation, built from AMD's open shaders: any GPU.",
+        "AMD's FSR 3.1 frame generation, built from AMD's open shaders: any GPU. At 2x only (it makes the frame halfway "
+        "between two of the game's): at 3x and above the built-in blend makes them.",
         "The renderer's own blend of the two frames around it: every GPU, the least sharp.",
     };
     if (variant < 0) v = fgm::effective(v, framegen_available());
@@ -538,7 +549,7 @@ const char* hn_filter(int v, int variant) {
 /// Sharpness: with DLSS or DLAA, the amount that suits them
 const char* hn_sharpness(int v, int variant) {
     static const char* const dlss = "DLSS and DLAA look softer than the game's own upscaler: around 80% suits them.";
-    const bool with_dlss = variant < 0 ? upscaler() != ur::GAME : variant == 1;
+    const bool with_dlss = variant < 0 ? upscaler() == ur::DLSS || upscaler() == ur::DLAA : variant == 1;
     if (variant > 1) return nullptr;
     return with_dlss ? dlss : v == 0 ? "Off: the picture as it is." : nullptr;
 }

@@ -962,17 +962,6 @@ def place_prebuilt_runtime(game_dir):
     return placed
 
 
-def prebuilt_has_dlss():
-    """(hookshot) The renderer this build installs instead of compiling one (HOOKSHOT_VK_PREBUILT: the AppImage's, or a Windows
-    release's tools/prebuilt) has NVIDIA DLSS in it. Its NGX start line is a string only a renderer built with the SDK has
-    (gpu/vk/vk_dlss.cpp ngx_init), so the bytes say it without loading the library"""
-    vk = os.environ.get("HOOKSHOT_VK_PREBUILT", "")
-    if not vk or not os.path.isfile(vk):
-        return False
-    with open(vk, "rb") as f:
-        return b"NVIDIA DLSS: NGX started" in f.read()
-
-
 def place_ngx_runtime(out):
     """(NVIDIA DLSS) a game built with NVIDIA's SDK (HOOKSHOT_NGX_SDK, as nx2/build.py takes it) gets DLSS's runtime in its ngx
     folder, where gpu/vk/vk_dlss.cpp looks first: nvngx_dlss.dll on Windows, libnvidia-ngx-dlss.so.<version> on Linux. Never
@@ -1130,10 +1119,6 @@ def main(a=None):
     if os.path.exists(os.path.join(work, "hookshot_pieces.prof")) and profile_readable(os.path.join(work, "hookshot_pieces.prof")):
         env["RX_PGO"] = os.path.join(work, "hookshot_pieces.prof")
 
-    # (NVIDIA DLSS's camera jitter: only in a build with it, nx2/oot_jitter.py. A prebuilt renderer with DLSS in it counts: the
-    # release's Windows one and the AppImage's are built with NVIDIA's SDK, which the player's PC does not have)
-    if ngx_built() or prebuilt_has_dlss():
-        env["OOT_DLSS_JITTER"] = "1"
     say("stage", "lift", "Translating the game to PC code")
     # (the same game, tools and settings as the lift before: its C is what this lift would write, and nothing recompiles from it. A
     # rebuild after a change to host/ alone skips the minutes of the lift)

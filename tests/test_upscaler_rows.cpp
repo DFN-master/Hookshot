@@ -53,23 +53,36 @@ int main() {
 
     // the Upscaler row only in a build with DLSS; the rows with nothing to choose
     CHECK("upscaler row shown", ur::upscaler_shown(true) && !ur::upscaler_shown(false));
-    // (hookshot) FSR 3.1 and FSR 4 on the same row: stepping visits only what runs here, and wraps
+    // AMD FSR 3.1 on the same row, after DLAA (hookshot fork: and AMD FSR 4 after it): stepping visits only what runs here,
+    // and wraps
     {
         const unsigned all = ur::bit(GAME) | ur::dlss_bits(true) | ur::bit(ur::FSR3) | ur::bit(ur::FSR4);
         const unsigned fsr3 = ur::bit(GAME) | ur::bit(ur::FSR3);
-        CHECK("upscaler steps through all five", ur::step_upscaler(2, 1, all) == ur::FSR3 &&
+        CHECK("FSR 3.1 after DLAA, FSR 4 after it", ur::FSR3 == 3 && ur::FSR4 == 4 && ur::kUpscalers == 5);
+        CHECK("upscaler steps through all five", ur::step_upscaler(DLAA, 1, all) == ur::FSR3 &&
+                                                   ur::step_upscaler(ur::FSR3, 1, all) == ur::FSR4 &&
                                                    ur::step_upscaler(ur::FSR4, 1, all) == GAME &&
-                                                   ur::step_upscaler(GAME, -1, all) == ur::FSR4);
+                                                   ur::step_upscaler(GAME, -1, all) == ur::FSR4 &&
+                                                   ur::step_upscaler(ur::FSR3, -1, all) == DLAA);
         CHECK("upscaler without DLSS skips it", ur::step_upscaler(GAME, 1, fsr3) == ur::FSR3 &&
                                                   ur::step_upscaler(ur::FSR3, 1, fsr3) == GAME &&
                                                   ur::step_upscaler(GAME, -1, fsr3) == ur::FSR3);
-        CHECK("an upscaler that cannot run here steps as the game's own", ur::step_upscaler(ur::FSR4, 1, fsr3) == ur::FSR3);
+        CHECK("an upscaler that cannot run here steps as the game's own", ur::step_upscaler(DLSS, 1, fsr3) == ur::FSR3 &&
+                                                                            ur::step_upscaler(ur::FSR4, 1, fsr3) == ur::FSR3 &&
+                                                                            ur::step_upscaler(ur::FSR3, 1, ur::bit(GAME)) == GAME);
+        CHECK("the DLSS-only form is the mask's", ur::step_upscaler(DLAA, 1, true) == GAME && ur::step_upscaler(GAME, -1, true) == DLAA);
         CHECK("upscaler fixed only with nothing but the game's own",
-              ur::upscaler_fixed(ur::bit(GAME)) && !ur::upscaler_fixed(fsr3));
-        CHECK("upscaler row shown with FSR alone", ur::upscaler_shown(false, true) && !ur::upscaler_shown(false, false));
+              ur::upscaler_fixed(ur::bit(GAME)) && !ur::upscaler_fixed(fsr3) && !ur::upscaler_fixed(all));
+        CHECK("upscaler row shown with FSR alone", ur::upscaler_shown(false, true) && !ur::upscaler_shown(false, false) &&
+                                                     ur::upscaler_shown(true, false));
         CHECK("FSR's modes are DLSS's shares", ur::scales_by_mode(ur::FSR3) && ur::scales_by_mode(ur::FSR4) &&
-                                                 !ur::scales_by_mode(DLAA) && !ur::scales_by_mode(GAME));
-        CHECK("the model row waits with FSR", ur::model_fixed(ur::FSR3, false) && ur::model_fixed(ur::FSR4, false));
+                                                 ur::scales_by_mode(DLSS) && !ur::scales_by_mode(DLAA) && !ur::scales_by_mode(GAME));
+        CHECK("FSR steps as DLSS does", ur::step(ur::FSR3, 0, 1) == 3 && ur::step(ur::FSR3, 3, 1) == 5 &&
+                                          ur::step(ur::FSR3, 6, 1) == 0 && ur::snap(ur::FSR3, 2) == 3 &&
+                                          ur::step(ur::FSR4, 0, 1) == 3 && ur::snap(ur::FSR4, 2) == 3);
+        CHECK("the model row waits with FSR", ur::model_fixed(ur::FSR3, false) && ur::model_fixed(ur::FSR4, false) &&
+                                                !ur::model_fixed(DLSS, false) && !ur::model_fixed(DLAA, false));
+        CHECK("FSR has a Render resolution", !ur::resolution_fixed(ur::FSR3) && !ur::resolution_fixed(ur::FSR4));
     }
     CHECK("upscaler fixed where DLSS cannot run", ur::upscaler_fixed(false) && !ur::upscaler_fixed(true));
     CHECK("render resolution fixed with DLAA only", ur::resolution_fixed(DLAA) && !ur::resolution_fixed(DLSS) &&
