@@ -847,7 +847,8 @@ def main():
             "-I" + os.path.join(GPU, "third_party", "suyu"),
             "-I" + os.path.join(vk, "sirit", "include"), "-I" + os.path.join(vk, "sirit", "src"),
             "-I" + os.path.join(spirv_headers, "include"), "-I" + os.path.join(spirv_headers, "include", "spirv", "unified1"),
-            "-I" + os.path.join(vk_headers, "include"), "-I" + vk, "-I" + gen_dir] +             (["-I" + os.path.join(cpm_package("vulkanmemoryallocator"), "include")] if cpm_package("vulkanmemoryallocator") else [])
+            "-I" + os.path.join(vk_headers, "include"), "-I" + vk, "-I" + gen_dir,
+            "-I" + os.path.join(kit.ROOT, "third_party", "zbic")] +             (["-I" + os.path.join(cpm_package("vulkanmemoryallocator"), "include")] if cpm_package("vulkanmemoryallocator") else [])
         # (NVIDIA DLSS, a local build's option: scripts/ngx_sdk.py. Only vk_dlss.cpp sees NVIDIA's headers; without them
         # it is the stubs that say DLSS is not there)
         ngx_flags = ["-DHOOKSHOT_NGX", "-I" + os.path.join(NGX_SDK, "include")] if NGX_SDK else []
@@ -894,6 +895,13 @@ def main():
                             (imgui_flags if os.path.basename(src) in imgui_users else []),
                             vk_lib_deps if lib else vdeps + (logo_text if os.path.basename(src) == "vk_imgui.cpp" else b"") +
                             (imgui_deps if os.path.basename(src) in imgui_users else b"")))
+        # (hookshot) the program cache's zstd compression (RX_VK_PROGRAM_CACHE_ZSTD): third_party/zbic's single-file
+        # zstd, built as C into the same DLL
+        zstd_src = os.path.join(kit.ROOT, "third_party", "zbic", "zstd.c")
+        if os.path.isfile(zstd_src):
+            vk_jobs.append((cc, zstd_src, os.path.join(obj_dir, "vk_zstd.o"),
+                            target() + CPU + ["-O2", "-g0", "-Wno-everything", "-I" + os.path.join(kit.ROOT, "third_party", "zbic")],
+                            b""))
         if NGX_SDK and not LINUX and toolchain.mingw():
             # (llvm-mingw: NVIDIA's static library was built with Microsoft's compiler for its static runtime (/MT). What it asks
             # of that runtime: the C parts as for the static FFmpeg (host/mingw_msvc_shims.c), the C++ ones in vk_ngx_msvc_rt.cpp)
