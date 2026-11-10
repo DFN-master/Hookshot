@@ -3,8 +3,9 @@
 // The third backend behind the Neural tab, beside Streamline (gpu/vk/vk_dlssnr.cpp) and NGX direct. Streamline runs
 // NVIDIA's own model through NVIDIA's own DLLs and is Windows-only; this runs a bit-exact Vulkan reimplementation of
 // the same network (https://github.com/maanHimself/OpenDLSS-NR, MIT, vendored in third_party/opendlss-nr) on the
-// renderer's own device, so it runs natively on Linux too. Today it needs an NVIDIA card with the extensions below;
-// the kernel layer is kept apart (gpu/vk/opennr/) for the AMD route docs/neural-rendering.md describes.
+// renderer's own device, so it runs natively on Linux too. On an NVIDIA card with VK_NV_cooperative_matrix2 it runs
+// upstream's kernels; anywhere else with VK_KHR_cooperative_matrix -- AMD's RDNA 3 and 4 above all -- it runs the khr
+// route (gpu/vk/opennr/khr: upstream's unfused graph on kernels that need only the KHR matrices, docs/neural-rendering.md).
 //
 // THE WEIGHTS ARE THE PLAYER'S. The network reads a model directory -- manifest.json and its stage files, upstream's
 // docs/weights.md -- that nothing public produces, and Hookshot provides no way to get one: nothing here extracts,

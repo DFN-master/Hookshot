@@ -21,9 +21,11 @@
 #include <string>
 #include <thread>
 
+#include "opennr/opennr_khr.h"
 #include "opennr/opennr_net.h"
 #include "opennr_ptx.h"   // (nx2/build.py generates it from third_party/opendlss-nr/scripts/ptx)
 #include "shaders/opennr_kernels_spv.h"
+#include "shaders/opennr_khr_spv.h"
 #include "shaders/opennr_post_comp_spv.h"
 #include "shaders/opennr_pre_comp_spv.h"
 #include "vk_camera_motion.h"
@@ -64,6 +66,7 @@ struct State {
     VkPhysicalDeviceShaderSMBuiltinsFeaturesNV sm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_FEATURES_NV};
     bool device_ok{};
     opennr_net::Route route = opennr_net::Route::Fast;
+    const opennr_khr::Variant* khr{};   // (the khr route's kernel variant, when that is the route)
     // the model
     std::atomic<int> phase{kIdle};
     std::atomic<bool> check_done{};
@@ -126,9 +129,15 @@ std::string model_directory() {
     return game_folder() + "/nr-model";
 }
 
-/// OpenDLSS-NR's host code reads its kernels from a folder (shaders/*.spv, ptx/*.ptx). The renderer carries them
-/// (the SPIR-V checked in, the PTX generated at build time) and writes them out once, to a folder named by their
-/// hash, so a stale folder from another build is never read.
+/// RX_VK_OPENNR_ROUTE=khr: the khr route even on a GPU that runs upstream's (its variant: RX_VK_OPENNR_KHR_VARIANT)
+bool khr_forced() {
+    const char* r = getenv("RX_VK_OPENNR_ROUTE");
+    return r && !strcmp(r, "khr");
+}
+
+/// OpenDLSS-NR's host code reads its kernels from a folder (shaders/*.spv, ptx/*.ptx; the khr route's from
+/// shaders-khr-<variant>/*.spv). The renderer carries them (the SPIR-V checked in, the PTX generated at build time) and
+/// writes them out once, to a folder named by their hash, so a stale folder from another build is never read.
 std::string materialize_kernels(std::string* error) {
     uint64_t h = 1469598103934665603ull;
     auto mix = [&](const void* data, size_t n) {
@@ -136,6 +145,7 @@ std::string materialize_kernels(std::string* error) {
         for (size_t i = 0; i < n; i++) h = (h ^ p[i]) * 1099511628211ull;
     };
     for (const auto& m : opennr_spv::kModules) mix(m.words, m.count * 4u), mix(m.name, strlen(m.name));
+    for (const auto& m : opennr_khr_spv::kModules) mix(m.words, m.count * 4u), mix(m.entry, strlen(m.entry));
     for (const auto& f : opennr_ptx::kFiles) mix(f.text, strlen(f.text)), mix(f.name, strlen(f.name));
     char tag[24];
     snprintf(tag, sizeof tag, "%016llx", (unsigned long long)h);
@@ -154,6 +164,21 @@ std::string materialize_kernels(std::string* error) {
     };
     for (const auto& m : opennr_spv::kModules)
         if (!write(dir / "shaders" / (std::string(m.name) + ".spv"), m.words, m.count * 4u)) return {};
+    // (a khr variant's folder: its own matrix kernels, the route's common ones, and upstream's vendor-neutral ones --
+    // the same thirteen names; scripts/opennr_kernels.py khr_folder_modules is the same rule)
+    for (const opennr_khr::Variant& v : opennr_khr::kVariants) {
+        const std::filesystem::path folder = dir / (std::string("shaders-khr-") + v.name);
+        std::filesystem::create_directories(folder, ec);
+        for (const auto& m : opennr_spv::kModules) {
+            const uint32_t* words = m.words;
+            unsigned count = m.count;
+            for (const char* prefix : {v.name, "common"})
+                for (const auto& k : opennr_khr_spv::kModules)
+                    if (words == m.words && std::string(k.entry) == std::string(prefix) + "/" + m.name)
+                        words = k.words, count = k.count;
+            if (!write(folder / (std::string(m.name) + ".spv"), words, count * 4u)) return {};
+        }
+    }
     for (const auto& f : opennr_ptx::kFiles)
         if (!write(dir / "ptx" / f.name, f.text, strlen(f.text))) return {};
     if (!write(dir / "complete", "", 0)) return {};
@@ -350,7 +375,7 @@ bool load(State& s, uint32_t w, uint32_t h) {
     {
         std::lock_guard qk(dev.present_mu);
         queue_flush_locked();
-        s.net = opennr_net::create(d, s.model_dir, kernels, s.route, &error);
+        s.net = opennr_net::create(d, s.model_dir, kernels, s.route, s.khr ? s.khr->name : nullptr, &error);
         if (s.net && !opennr_net::build(s.net, w, h, &s.built, &error)) {
             device_wait_idle_locked();
             std::lock_guard pq(dev.present_queue_mu);   // (upstream's context waits for the device as it goes)
@@ -421,12 +446,15 @@ void read_timing(State& s, VkCommandBuffer cmd, uint32_t slot) {
 bool selected() {
     // The device is made for the network (its extensions and features, below) when it can be wanted this run: the
     // Backend row's Open, RX_VK_NR_BACKEND=open or RX_VK_DLSS_NR_BACKEND=open|3, or a model folder already in place
-    // (so Auto can fall to it). Asked once, at device creation: the device cannot gain extensions afterwards, so a
-    // model folder put in place later wants a restart, and why() says so.
+    // (so Auto can fall to it), or a GPU that is not NVIDIA's -- AMD's above all, where Open is the only backend there
+    // is, and whose khr route asks for nothing the renderer does not already (only E4M3 matrices, where there are any).
+    // Asked once, at device creation (dev.props is the GPU by then): the device cannot gain extensions afterwards, so a
+    // model folder put in place later on an NVIDIA card wants a restart, and why() says so.
     static const bool open = [] {
         if (const char* e = getenv("RX_VK_NR_BACKEND"); e && !strcmp(e, "open")) return true;
         if (const char* e = getenv("RX_VK_DLSS_NR_BACKEND"); e && (!strcmp(e, "open") || !strcmp(e, "3"))) return true;
         if (opts.nr_backend == 3) return true;
+        if (dev.physical && dev.props.vendorID != 0x10de) return true;   // (not NVIDIA: Open, the khr route)
         FILE* f = fopen((model_directory() + "/manifest.json").c_str(), "rb");
         if (f) fclose(f);
         return f != nullptr;
@@ -450,10 +478,18 @@ void device_extensions(std::vector<const char*>& want, const std::vector<VkExten
         want.push_back(name);
         logf("vk: open NR wants %s: enabled", name);
     };
-    add(VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME, s.want_coop2, "the GLSL kernels' workgroup-scope matrices");
-    add(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME, s.want_fp8, "the network's E4M3 arithmetic");
-    add(VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME, s.want_cuda, "the PTX kernels: without it the GLSL kernels run");
-    add(VK_NV_SHADER_SM_BUILTINS_EXTENSION_NAME, s.want_sm, "the SM count the persistent kernels size by");
+    // (RX_VK_OPENNR_ROUTE=khr: only what the khr route can use, E4M3 matrices where there are any; otherwise what
+    // upstream's NVIDIA routes need too, where the GPU has it -- an AMD GPU has none of the NV ones, and runs khr)
+    if (!khr_forced()) {
+        add(VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME, s.want_coop2,
+            "upstream's GLSL kernels' workgroup-scope matrices; the khr route needs none");
+    }
+    add(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME, s.want_fp8,
+        "E4M3 matrices: upstream's routes need them, the khr route widens E4M3 to f16 without them");
+    if (!khr_forced()) {
+        add(VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME, s.want_cuda, "the PTX kernels: without it the GLSL kernels run");
+        add(VK_NV_SHADER_SM_BUILTINS_EXTENSION_NAME, s.want_sm, "the SM count the persistent kernels size by");
+    }
 }
 
 void device_features(void**& tail) {
@@ -470,7 +506,7 @@ void device_created() {
     State& s = state();
     // What upstream's vk::DeviceRequirements turns on, against what this device was made with. The renderer turns
     // on every core feature its GPU has (vk_main.cpp), so the core ones are the GPU's; the Vulkan 1.1 ones are asked
-    // again because the renderer does not keep them.
+    // again because the renderer does not keep them. These every route needs; the matrices decide which route.
     VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = &f11;
@@ -480,12 +516,6 @@ void device_created() {
         if (!have) missing += missing.empty() ? name : std::string(", ") + name;
     };
     need(dev.coop_matrix, "VK_KHR_cooperative_matrix");
-    need(s.want_coop2 && s.coop2.cooperativeMatrixWorkgroupScope && s.coop2.cooperativeMatrixFlexibleDimensions &&
-             s.coop2.cooperativeMatrixReductions && s.coop2.cooperativeMatrixConversions &&
-             s.coop2.cooperativeMatrixPerElementOperations && s.coop2.cooperativeMatrixTensorAddressing &&
-             s.coop2.cooperativeMatrixBlockLoads,
-         "VK_NV_cooperative_matrix2 with all its features");
-    need(s.want_fp8 && s.fp8.shaderFloat8 && s.fp8.shaderFloat8CooperativeMatrix, "VK_EXT_shader_float8");
     need(f11.storageBuffer16BitAccess && f11.uniformAndStorageBuffer16BitAccess, "16-bit storage");
     need(dev.vk12.storageBuffer8BitAccess && dev.vk12.uniformAndStorageBuffer8BitAccess && dev.vk12.shaderInt8,
          "8-bit storage");
@@ -495,21 +525,87 @@ void device_created() {
     need(dev.vk13.subgroupSizeControl && dev.vk13.computeFullSubgroups, "subgroup size control");
     need(dev.vk13.maintenance4, "maintenance4");
     need(dev.features.shaderInt16 && dev.features.shaderInt64, "16- and 64-bit integers");
-    s.device_ok = missing.empty();
-    const bool cuda = s.want_cuda && s.cuda.cudaKernelLaunchFeatures;
-    s.route = cuda ? opennr_net::Route::Fast : opennr_net::Route::Glsl;
-    if (const char* r = getenv("RX_VK_OPENNR_ROUTE")) {
-        if (!strcmp(r, "glsl")) s.route = opennr_net::Route::Glsl;
-        else if (!strcmp(r, "reference")) s.route = opennr_net::Route::Reference;
-        else if (!strcmp(r, "fast") && !cuda) logf("vk: open NR: RX_VK_OPENNR_ROUTE=fast needs VK_NV_cuda_kernel_launch");
+
+    // upstream's NVIDIA routes: VK_NV_cooperative_matrix2 with all seven of its features, and E4M3 matrices
+    const bool fp8 = s.want_fp8 && s.fp8.shaderFloat8 && s.fp8.shaderFloat8CooperativeMatrix;
+    const bool nv = s.want_coop2 && s.coop2.cooperativeMatrixWorkgroupScope && s.coop2.cooperativeMatrixFlexibleDimensions &&
+                    s.coop2.cooperativeMatrixReductions && s.coop2.cooperativeMatrixConversions &&
+                    s.coop2.cooperativeMatrixPerElementOperations && s.coop2.cooperativeMatrixTensorAddressing &&
+                    s.coop2.cooperativeMatrixBlockLoads && fp8;
+    const bool cuda = nv && s.want_cuda && s.cuda.cudaKernelLaunchFeatures;
+    // the khr route: the first of its kernel variants whose matrix shapes the driver lists (gpu/vk/opennr/opennr_khr.h)
+    opennr_khr::Device kd;
+    kd.float8_matrices = fp8;
+    {
+        VkPhysicalDeviceSubgroupSizeControlProperties sc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &sc;
+        vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+        kd.min_subgroup = sc.minSubgroupSize, kd.max_subgroup = sc.maxSubgroupSize;
+        kd.subgroup_control_compute = dev.vk13.subgroupSizeControl && dev.vk13.computeFullSubgroups &&
+                                      (sc.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT);
     }
+    std::string shapes;
+    if (dev.coop_matrix && vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR) {
+        uint32_t n = 0;
+        vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(dev.physical, &n, nullptr);
+        std::vector<VkCooperativeMatrixPropertiesKHR> props(n, {VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
+        vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(dev.physical, &n, props.data());
+        auto type = [](VkComponentTypeKHR c) {
+            return c == VK_COMPONENT_TYPE_FLOAT16_KHR         ? "f16"
+                   : c == VK_COMPONENT_TYPE_FLOAT32_KHR       ? "f32"
+                   : c == VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT   ? "e4m3"
+                   : c == VK_COMPONENT_TYPE_FLOAT8_E5M2_EXT   ? "e5m2"
+                   : c == VK_COMPONENT_TYPE_BFLOAT16_KHR      ? "bf16"
+                                                              : "int";
+        };
+        for (const auto& p : props) {
+            kd.shapes.push_back({p.MSize, p.NSize, p.KSize, p.AType, p.BType, p.CType, p.ResultType, p.scope});
+            if (p.scope != VK_SCOPE_SUBGROUP_KHR || !strcmp(type(p.AType), "int")) continue;
+            char one[64];
+            snprintf(one, sizeof one, "%s%ux%ux%u %s>%s", shapes.empty() ? "" : ", ", p.MSize, p.NSize, p.KSize,
+                     type(p.AType), type(p.ResultType));
+            shapes += one;
+        }
+    }
+    std::string khr_why;
+    const char* forced_variant = getenv("RX_VK_OPENNR_KHR_VARIANT");
+    s.khr = dev.coop_matrix ? opennr_khr::choose(kd, forced_variant, &khr_why) : nullptr;
+    if (!dev.coop_matrix) khr_why = "no VK_KHR_cooperative_matrix";
+
+    // The route: upstream's fast one where the CUDA launch is, its GLSL one where only its matrices are, the khr one
+    // anywhere else it can run; RX_VK_OPENNR_ROUTE over that, where the GPU allows it
+    if (cuda) s.route = opennr_net::Route::Fast;
+    else if (nv) s.route = opennr_net::Route::Glsl;
+    else s.route = opennr_net::Route::Khr;
+    if (const char* r = getenv("RX_VK_OPENNR_ROUTE")) {
+        if (!strcmp(r, "khr")) s.route = opennr_net::Route::Khr;
+        else if (!strcmp(r, "glsl") && nv) s.route = opennr_net::Route::Glsl;
+        else if (!strcmp(r, "reference") && nv) s.route = opennr_net::Route::Reference;
+        else if (!strcmp(r, "fast") && cuda) s.route = opennr_net::Route::Fast;
+        else logf("vk: open NR: RX_VK_OPENNR_ROUTE=%s cannot run here (%s); %s", r,
+                  nv ? "no VK_NV_cuda_kernel_launch" : "upstream's routes need VK_NV_cooperative_matrix2 and E4M3 matrices",
+                  opennr_net::route_name(s.route));
+    }
+    if (s.route == opennr_net::Route::Khr && !s.khr)
+        missing += std::string(missing.empty() ? "" : "; ") + "matrices it can use (upstream's routes need "
+                   "VK_NV_cooperative_matrix2 and E4M3 matrices; the khr route found " + khr_why + ")";
+    s.device_ok = missing.empty();
+    logf("vk: open NR: cooperative matrices listed: %s", shapes.empty() ? "none" : shapes.c_str());
     if (!s.device_ok) {
         logf("vk: open NR is not available on this GPU: it lacks %s", missing.c_str());
         set_why(s, "Not available on this GPU: it lacks what the network needs (the log names it).");
         return;
     }
-    logf("vk: open NR: this GPU can run the network (%s)%s", opennr_net::route_name(s.route),
-         dev.features.robustBufferAccess ? "; robust buffer access is on, which upstream measured at ~15%" : "");
+    if (s.route == opennr_net::Route::Khr) {
+        logf("vk: open NR: this GPU can run the network: %s, variant %s (%s; %u-lane subgroups)%s%s",
+             opennr_net::route_name(s.route), s.khr->name, s.khr->what, s.khr->subgroup,
+             khr_why.empty() ? "" : "; not the others: ", khr_why.c_str());
+    } else {
+        s.khr = nullptr;
+        logf("vk: open NR: this GPU can run the network (%s)", opennr_net::route_name(s.route));
+    }
+    if (dev.features.robustBufferAccess) logf("vk: open NR: robust buffer access is on, which upstream measured at ~15%%");
 }
 
 bool asked() {

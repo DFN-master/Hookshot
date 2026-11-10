@@ -659,12 +659,14 @@ Row rows[] = {
     // look dead for a whole release (docs/upscaling.md).
     {TAB_NEURAL, "Neural rendering", &opts.nr, 0, 1, 1, tx_onoff,
      "DLSS 5 neural rendering: NVIDIA's model goes over the finished frame and rebuilds detail, tone and structure in it. "
-     "Needs an NVIDIA RTX card and NVIDIA's model file (readme.md; Backend says how it is reached); the rows below are the model's own "
-     "settings and do nothing while this is Off.", hn_nr},
+     "Needs an NVIDIA RTX card and NVIDIA's model file, or, through Open, an NVIDIA RTX 40/50 or AMD RX 7000/9000 card and a model "
+     "folder you supply (readme.md; Backend says how it is reached); the rows below are the model's own settings and do nothing "
+     "while this is Off.", hn_nr},
     {TAB_NEURAL, "Backend", &opts.nr_backend, 0, 3, 1, tx_nr_backend,
      "What runs the model. Streamline and NGX direct are NVIDIA's runtime; Open is OpenDLSS-NR, an open Vulkan network "
-     "that reads a model folder you supply (nr-model in the game folder). Auto takes Streamline, then NGX direct, then "
-     "Open where a model folder is there. The rows below apply to whichever runs (readme.md).", hn_nr_backend},
+     "for NVIDIA and AMD cards that reads a model folder you supply (nr-model in the game folder). Auto takes Streamline, "
+     "then NGX direct, then Open where a model folder is there, and Open on a card that is not NVIDIA's. The rows below "
+     "apply to whichever runs (readme.md).", hn_nr_backend},
     {TAB_NEURAL, "Model", &opts.nr_model, 0, 3, 1, tx_nr_model,
      "How much work the model does per frame: Performance is the cheapest, DLAA the most expensive, Quality the model's "
      "own default. Streamline 2.14's plugin ignores this one -- it is sent correctly and a later NVIDIA release is "

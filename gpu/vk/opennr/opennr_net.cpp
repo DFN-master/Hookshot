@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "json.h"
+#include "opennr_khr.h"
 #include "kernels.h"
 #include "nr_graph.h"
 #include "nr_model.h"
@@ -136,11 +137,17 @@ void fall_back_to_barriers(Network* n) {
 const char* route_name(Route route) {
     return route == Route::Fast        ? "PTX kernels through VK_NV_cuda_kernel_launch, counter chaining"
            : route == Route::Glsl      ? "the fused GLSL kernels, no PTX"
+           : route == Route::Khr       ? "the khr kernels (VK_KHR_cooperative_matrix only), unfused"
                                        : "the GLSL reference kernels, unfused";
 }
 
 Network* create(const Device& d, const std::string& model_dir, const std::string& kernel_dir, Route route,
-                std::string* error) {
+                const char* khr_variant, std::string* error) {
+    const opennr_khr::Variant* khr = route == Route::Khr ? opennr_khr::find(khr_variant) : nullptr;
+    if (route == Route::Khr && !khr) {
+        if (error) *error = std::string("no khr kernel variant named ") + (khr_variant ? khr_variant : "(none)");
+        return nullptr;
+    }
     // Upstream's route switches are environment variables its kernels read once, at first use, so they are set
     // before any of it runs. The GLSL routes also point the PTX folder at an empty one: a PTX kernel reached anyway
     // would then fail to load, loudly, instead of calling a CUDA launch this device may not have.
@@ -152,13 +159,17 @@ Network* create(const Device& d, const std::string& model_dir, const std::string
         set_env("DLSS5VK_PTX_DIR", (kernel_dir + "/no-ptx").c_str());
         nr::Kernels::setChainEnabled(false);
     }
+    // (the khr kernels are made for their variant's subgroup size: the patched copy of upstream's vk_context.cpp makes
+    // its pipelines with it, scripts/opennr_kernels.py SOURCE_PATCHES; every other route keeps upstream's 32)
+    set_env("HOOKSHOT_OPENNR_SUBGROUP_SIZE", khr ? std::to_string(khr->subgroup).c_str() : "0");
     auto n = std::make_unique<Network>();
     n->route = route;
     try {
         ovk::volkUseInstanceProcAddr(d.get_instance_proc_addr);
         n->context = std::make_unique<vk::Context>(d.instance, d.physical, d.device, d.queue_family, d.queue_index);
         n->model = std::make_unique<nr::Model>(*n->context, model_dir, false);   // (hashed by check_model already)
-        n->kernels = std::make_unique<nr::Kernels>(*n->context, kernel_dir + "/shaders");
+        n->kernels = std::make_unique<nr::Kernels>(
+            *n->context, kernel_dir + (khr ? std::string("/shaders-khr-") + khr->name : std::string("/shaders")));
         n->kernels->setSiluTable(ref::siluTable());
         try {
             const nr::Tensor& b = n->model->tensor(70, 0, "blend_scale");
@@ -188,7 +199,7 @@ bool build(Network* n, uint32_t width, uint32_t height, Built* out, std::string*
         n->features = nullptr;
         const nr::Geometry g = nr::Geometry::fromValid(width, height);
         nr::Graph::Options options;
-        options.fusedBlocks = n->route != Route::Reference;
+        options.fusedBlocks = n->route != Route::Reference && n->route != Route::Khr;   // (khr: its kernels are the unfused ones)
         n->graph = std::make_unique<nr::Graph>(*n->context, *n->model, *n->kernels, g, options);
         n->features = n->graph->allocate("input features", g.fullWidth * g.fullHeight, 16, nr::Format::F32);
         // A warm-up record and run (upstream's demo does the same): the first record allocates every activation,
