@@ -4,6 +4,22 @@
 
 #include "vk_ffx.h"
 
+#include <cstdlib>
+
+#include "upscaler_rows.h"
+#include "vk_menu.h"
+
+namespace mkwvk {
+bool fsr4_wanted() {
+    static const bool off = [] {
+        const char* e = getenv("RX_VK_FSR");
+        return e && *e && atoi(e) == 0;
+    }();
+    // (the row first: AMD's runtime is not looked for while the row is not on FSR 4)
+    return !off && opts.dlss == upscaler_rows::FSR4 && ffx::upscale_supported();
+}
+} // namespace mkwvk
+
 #if defined(_WIN32)
 
 #include <windows.h>
@@ -31,6 +47,7 @@ int env_int(const char* name, int fallback) {
 struct Image {
     VkImage image = VK_NULL_HANDLE;
     VmaAllocation memory = nullptr;
+    VkImageView view = VK_NULL_HANDLE;   // (for the pass that squares the upscaler's picture back: vk_fsr3.cpp)
     uint32_t width = 0, height = 0;
     VkFormat format = VK_FORMAT_UNDEFINED;
 };
@@ -51,7 +68,7 @@ struct State {
     uint32_t up_rw = 0, up_rh = 0, up_ow = 0, up_oh = 0;
     Image up_out;
     bool up_first = true;
-    LARGE_INTEGER up_last{};
+    bool up_infinite = false;   // (the context's FFX_UPSCALE_ENABLE_DEPTH_INFINITE: made again when the camera's differs)
     bool up_failed = false;
 
     // frame generation
@@ -60,6 +77,7 @@ struct State {
     ffxContext fg = nullptr;
     uint32_t fg_w = 0, fg_h = 0, fg_rw = 0, fg_rh = 0;
     VkFormat fg_format = VK_FORMAT_UNDEFINED;
+    bool fg_infinite = false;
     Image made[4];
     uint64_t frame_id = 0;
     bool fg_reset = true;
@@ -187,7 +205,11 @@ FfxApiResource resource(VkImage image, VkFormat format, uint32_t w, uint32_t h, 
                                write ? FFX_API_RESOURCE_STATE_UNORDERED_ACCESS : FFX_API_RESOURCE_STATE_GENERIC_READ);
 }
 
+/// A far plane the runtime should take as infinite: none given (0), or FLT_MAX (fsr3_math.h: an infinite projection)
+bool infinite(float near_plane, float far_plane) { return !(far_plane > near_plane) || far_plane >= FLT_MAX; }
+
 void drop(Image& im) {
+    if (im.view) vkDestroyImageView(dev.device, im.view, nullptr);
     if (im.image) destroy_image(im.image, im.memory);
     im = Image{};
 }
@@ -210,6 +232,14 @@ bool make(VkCommandBuffer cmd, Image& im, VkFormat format, uint32_t w, uint32_t 
         return false;
     }
     im.width = w, im.height = h, im.format = format;
+    VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vc.image = im.image, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = format;
+    vc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (vkCreateImageView(dev.device, &vc, nullptr, &im.view) != VK_SUCCESS) {
+        logf("vk: amd fsr 4: a view of a %ux%u image was not made", w, h);
+        drop(im);
+        return false;
+    }
     VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     b.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
     b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
@@ -284,8 +314,9 @@ bool upscale(VkCommandBuffer cmd, const UpscaleInputs& in) {
     if (!in.color || !in.depth || !in.motion || !in.render_width || !in.render_height || !in.upscale_width ||
         !in.upscale_height || !(in.near_plane > 0.0f) || !(in.fov_y > 0.0f))
         return false;
+    const bool inf = infinite(in.near_plane, in.far_plane);
     if (s.up && (in.render_width > s.up_rw || in.render_height > s.up_rh || in.upscale_width != s.up_ow ||
-                 in.upscale_height != s.up_oh))
+                 in.upscale_height != s.up_oh || inf != s.up_infinite))
         drop_upscaler();
     if (!s.up) {
         ffxCreateBackendVKDesc backend{};
@@ -294,11 +325,13 @@ bool upscale(VkCommandBuffer cmd, const UpscaleInputs& in) {
         ffxCreateContextDescUpscale c{};
         c.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
         c.header.pNext = &backend.header;
-        // HDR in (the scene is B10G11R11 float), reversed depth with an infinite far plane (the game's),
-        // and no exposure texture, so the runtime works the exposure out itself. The render size may
-        // change under the context as the game's dynamic resolution moves, within the maximum.
+        // The colour as FSR 3.1's passes take it (compiled with FFX_FSR3UPSCALER_OPTION_HDR_COLOR_INPUT), the depth
+        // reversed as vk_fsr3_inputs.cpp makes it (1 at the near plane), infinite only when the scene's projection is
+        // (it is not: its far plane is at 1000.5), and no exposure texture, so the runtime works the exposure out
+        // itself. The render size may change under the context as the game's dynamic resolution moves, within the
+        // maximum.
         c.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_DEPTH_INVERTED |
-                  FFX_UPSCALE_ENABLE_DEPTH_INFINITE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE |
+                  (inf ? FFX_UPSCALE_ENABLE_DEPTH_INFINITE : 0u) | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE |
                   FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION;
         if (env_int("RX_VK_FFX_DEBUG", 0) > 0) c.flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
         c.maxRenderSize = {in.upscale_width, in.upscale_height};
@@ -319,19 +352,12 @@ bool upscale(VkCommandBuffer cmd, const UpscaleInputs& in) {
         s.up_rw = in.upscale_width, s.up_rh = in.upscale_height;
         s.up_ow = in.upscale_width, s.up_oh = in.upscale_height;
         s.up_first = true;
+        s.up_infinite = inf;
         ffxQueryGetProviderVersion v{};
         v.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
         if (s.query(&s.up, &v.header) == FFX_API_RETURN_OK && v.versionName) s.up_provider = v.versionName;
         logf("vk: amd fsr 4: %s from up to %ux%u to %ux%u", s.up_provider.c_str(), s.up_rw, s.up_rh, s.up_ow, s.up_oh);
     }
-    LARGE_INTEGER now, freq;
-    QueryPerformanceCounter(&now);
-    QueryPerformanceFrequency(&freq);
-    float dt_ms = 16.667f;
-    if (!s.up_first && s.up_last.QuadPart)
-        dt_ms = (float)(1000.0 * (double)(now.QuadPart - s.up_last.QuadPart) / (double)freq.QuadPart);
-    s.up_last = now;
-
     ffxDispatchDescUpscale d{};
     d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
     d.commandList = (void*)cmd;
@@ -339,19 +365,19 @@ bool upscale(VkCommandBuffer cmd, const UpscaleInputs& in) {
     d.depth = resource(in.depth, in.depth_format, in.render_width, in.render_height, false);
     d.motionVectors = resource(in.motion, in.motion_format, in.render_width, in.render_height, false);
     d.output = resource(s.up_out.image, s.up_out.format, s.up_ow, s.up_oh, true);
-    // (the jitter and the motion as vk_fsr3.cpp hands them to the same upscaler's sources: render pixels,
-    //  and the vectors already in render pixels, so the scale is 1)
+    // (the jitter and the motion as vk_fsr3.cpp hands them to FSR 3.1's passes: render pixels, x right and y down, and
+    //  the vectors already in render pixels, so the scale is 1)
     d.jitterOffset = {in.jitter[0], in.jitter[1]};
     d.motionVectorScale = {in.motion_scale[0], in.motion_scale[1]};
     d.renderSize = {in.render_width, in.render_height};
     d.upscaleSize = {s.up_ow, s.up_oh};
     d.enableSharpening = false;   // (the Sharpness row sharpens the finished picture already)
     d.sharpness = 0.0f;
-    d.frameTimeDelta = std::clamp(dt_ms, 0.0f, 1000.0f);
+    d.frameTimeDelta = std::clamp(in.frame_time_ms, 0.0f, 1000.0f);
     d.preExposure = 1.0f;
     d.reset = in.reset || s.up_first;
     d.cameraNear = in.near_plane;
-    d.cameraFar = in.far_plane > in.near_plane ? in.far_plane : FLT_MAX;
+    d.cameraFar = inf ? FLT_MAX : in.far_plane;
     d.cameraFovAngleVertical = in.fov_y;
     d.viewSpaceToMetersFactor = 1.0f;
     d.flags = 0;
@@ -368,6 +394,7 @@ bool upscale(VkCommandBuffer cmd, const UpscaleInputs& in) {
 }
 
 VkImage output_image() { return st().up_out.image; }
+VkImageView output_view() { return st().up_out.view; }
 
 bool frames_supported() {
     State& s = st();
@@ -396,8 +423,9 @@ bool generate(VkCommandBuffer cmd, const FrameInputs& in) {
     if (!in.color || !in.depth || !in.motion || !in.width || !in.height || !in.render_width || !in.render_height ||
         in.frames < 1 || in.frames > 4 || !(in.near_plane > 0.0f) || !(in.fov_y > 0.0f))
         return false;
+    const bool inf = infinite(in.near_plane, in.far_plane);
     if (s.fg && (in.width != s.fg_w || in.height != s.fg_h || in.render_width > s.fg_rw ||
-                 in.render_height > s.fg_rh || in.color_format != s.fg_format))
+                 in.render_height > s.fg_rh || in.color_format != s.fg_format || inf != s.fg_infinite))
         drop_framegen();
     if (!s.fg) {
         ffxCreateBackendVKDesc backend{};
@@ -410,9 +438,10 @@ bool generate(VkCommandBuffer cmd, const FrameInputs& in) {
         ffxCreateContextDescFrameGeneration c{};
         c.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
         c.header.pNext = &version.header;
-        // The presented frame is SDR (RGBA8, already tonemapped by the game), depth as the upscaler's.
-        // Not ASYNC_WORKLOAD_SUPPORT: the made frames are recorded into the replay's own command buffer.
-        c.flags = FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED | FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE;
+        // The presented frame is SDR (RGBA8, already tonemapped by the game), depth as the upscaler's (reversed,
+        // infinite only when the scene's projection is). Not ASYNC_WORKLOAD_SUPPORT: the made frames are recorded into
+        // the replay's own command buffer.
+        c.flags = FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED | (inf ? FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE : 0u);
         if (env_int("RX_VK_FFX_DEBUG", 0) > 0) c.flags |= FFX_FRAMEGENERATION_ENABLE_DEBUG_CHECKING;
         c.displaySize = {in.width, in.height};
         c.maxRenderSize = {in.width, in.height};
@@ -434,6 +463,7 @@ bool generate(VkCommandBuffer cmd, const FrameInputs& in) {
             }
         s.fg_w = in.width, s.fg_h = in.height, s.fg_rw = in.width, s.fg_rh = in.height;
         s.fg_format = in.color_format;
+        s.fg_infinite = inf;
         s.fg_reset = true;
         ffxQueryGetProviderVersion v{};
         v.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
@@ -473,15 +503,14 @@ bool generate(VkCommandBuffer cmd, const FrameInputs& in) {
     prep.frameTimeDelta = std::clamp(in.frame_time_ms, 0.0f, 1000.0f);
     prep.reset = reset;
     prep.cameraNear = in.near_plane;
-    prep.cameraFar = in.far_plane > in.near_plane ? in.far_plane : FLT_MAX;
+    prep.cameraFar = inf ? FLT_MAX : in.far_plane;
     prep.cameraFovAngleVertical = in.fov_y;
     prep.viewSpaceToMetersFactor = 1.0f;
     prep.depth = resource(in.depth, in.depth_format, in.render_width, in.render_height, false);
     prep.motionVectors = resource(in.motion, in.motion_format, in.render_width, in.render_height, false);
     if (in.have_view) {
-        // (the view is world -> camera, 3x4 row major: its rows are the camera's axes in the world, and its
-        //  position is minus the transposed rotation times the translation; vk_framegen.cpp's DLSS-G does
-        //  the same)
+        // (the view is world -> camera, row major: its rows are the camera's axes in the world, and its position is
+        //  minus the transposed rotation times the translation; vk_framegen.cpp's DLSS-G does the same)
         const float* v = in.view;
         for (int c = 0; c < 3; c++) {
             prep.cameraRight[c] = v[0 * 4 + c];
@@ -547,6 +576,7 @@ bool upscale_supported() { return false; }
 const char* upscale_provider() { return ""; }
 bool upscale(VkCommandBuffer, const UpscaleInputs&) { return false; }
 VkImage output_image() { return VK_NULL_HANDLE; }
+VkImageView output_view() { return VK_NULL_HANDLE; }
 bool frames_supported() { return false; }
 uint32_t frames_wanted() { return 0; }
 bool generate(VkCommandBuffer, const FrameInputs&) { return false; }

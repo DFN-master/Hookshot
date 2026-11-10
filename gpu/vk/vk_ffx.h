@@ -13,8 +13,10 @@
 // and, with SDK 2.4, on the cards AMD added since; on other GPUs it falls back to the FSR 3.1 it carries.
 // upscale_provider() says which one a run got, and the log says it once.
 //
-// The inputs are vk_fsr3.h's, field for field, plus the images and formats: AMD's API is handed whole
-// resources (an image, its format and extent) rather than views, as NGX is.
+// The inputs are FSR 3.1's (gpu/vk/vk_fsr3_inputs.h: colour as the game's network samples it, the depth reversed, the
+// camera's motion without the jitter, the jitter, and the camera from the scene's own projection), handed over as whole
+// images: AMD's API takes resources (an image, its format and extent) rather than views, as NGX does. vk_fsr3.cpp's
+// fsr3_upscale calls the upscaler and squares its picture back into the network's output, as it does FSR 3.1's.
 #pragma once
 
 #include <cstdint>
@@ -24,9 +26,9 @@
 namespace mkwvk::ffx {
 
 struct UpscaleInputs {
-    VkImage color = VK_NULL_HANDLE;   ///< HDR (B10G11R11 here), jittered, at the render size
-    VkImage depth = VK_NULL_HANDLE;   ///< reversed, infinite far plane
-    VkImage motion = VK_NULL_HANDLE;  ///< render pixels, pointing at the previous frame
+    VkImage color = VK_NULL_HANDLE;   ///< jittered, at the render size (vk_fsr3_inputs.h Frame: RGBA16F, 0..1)
+    VkImage depth = VK_NULL_HANDLE;   ///< reversed: 1 at the near plane (vk_fsr3_inputs.h Frame)
+    VkImage motion = VK_NULL_HANDLE;  ///< render pixels, pointing at the previous frame, without the jitter
     VkFormat color_format = VK_FORMAT_UNDEFINED;
     VkFormat depth_format = VK_FORMAT_UNDEFINED;
     VkFormat motion_format = VK_FORMAT_UNDEFINED;
@@ -35,8 +37,9 @@ struct UpscaleInputs {
     float jitter[2]{};                  ///< render pixels, as vk_fsr3.h's
     float motion_scale[2]{1.0f, 1.0f};  ///< turns a motion vector into render pixels
     float near_plane = 0.1f;
-    float far_plane = 0.0f;   ///< 0: infinite
+    float far_plane = 0.0f;   ///< 0 or FLT_MAX: infinite (FFX_UPSCALE_ENABLE_DEPTH_INFINITE); the scene's is 1000.5
     float fov_y = 60.0f * 3.14159265358979f / 180.0f;
+    float frame_time_ms = 16.667f;
     bool reset = false;
 };
 
@@ -52,6 +55,7 @@ struct UpscaleInputs {
 /// inputs are not usable or the runtime refused, which leaves the caller to do what it would have.
 [[nodiscard]] bool upscale(VkCommandBuffer cmd, const UpscaleInputs& in);
 [[nodiscard]] VkImage output_image();
+[[nodiscard]] VkImageView output_view();
 
 /// One frame generation's inputs: vk_fsr3fi.h's, with the images the API needs.
 struct FrameInputs {
@@ -66,10 +70,10 @@ struct FrameInputs {
     float motion_scale[2]{1.0f, 1.0f};
     float jitter[2]{};
     float near_plane = 0.1f;
-    float far_plane = 0.0f;
+    float far_plane = 0.0f;   ///< 0 or FLT_MAX: infinite, as UpscaleInputs
     float fov_y = 60.0f * 3.14159265358979f / 180.0f;
     float frame_time_ms = 16.667f;
-    /// The camera, row major (vk_draw.h SceneFrameInputs): its position and axes come out of it.
+    /// The camera's view (world to camera), row major: its position and axes come out of it.
     float view[16]{};
     bool have_view = false;
     bool reset = false;
@@ -91,3 +95,9 @@ void reset();
 void shutdown();
 
 } // namespace mkwvk::ffx
+
+namespace mkwvk {
+/// FSR 4 upscales: the Insert menu's Upscaler row says FSR 4 (upscaler_rows.h FSR4) and AMD's runtime runs here (never on
+/// Linux). RX_VK_FSR=0 turns it off as it does FSR 3.1. Read each time: the row changes while the game runs
+bool fsr4_wanted();
+} // namespace mkwvk

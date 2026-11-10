@@ -217,8 +217,14 @@ card runs: FSR 4's machine-learning upscaler on an RX 9000 (and the cards AMD ad
 carries on others. The log's `vk: amd fsr 4:` lines say which one you got. To try another copy of AMD's DLLs, put them in
 a folder and name it with `RX_VK_FFX_DIR`; `RX_VK_FFX=0` keeps them from being loaded at all.
 
+**Both FSRs are given the same inputs** as upstream's FSR 3.1 (below): the scene's colour as the game's network samples it,
+its depth (turned round for AMD, which wants it reversed), motion from the camera, the projection the scene is drawn with
+(near 0.1, far 1000.5, a 45 degree field of view) and the camera jitter DLSS uses. DLSS frame generation and FSR 4's take
+the same depth, motion and camera.
+
 **Frame generation** -- with **Frame generation method** on Auto -- takes the first of these that runs on your PC: NVIDIA DLSS frame generation (`nvngx_dlssg.dll` in
-the `ngx` folder, RTX 40 and 50), AMD FSR 4's (Windows), AMD FSR 3.1's (any GPU), then the renderer's own blend. Or pick one in **Frame generation method**: the row offers only the methods that run here,
+the `ngx` folder, RTX 40 and 50), AMD FSR 4's (Windows), AMD FSR 3.1's (any GPU, at 2x only: it makes the frame halfway
+between two of the game's and no other, so at 3x and above it is passed over), then the renderer's own blend. Or pick one in **Frame generation method**: the row offers only the methods that run here,
 and a frame the chosen method cannot make falls back to the built-in blend. The log's `vk: frame generation method:` line
 says which is in effect (`RX_VK_FG_METHOD=0..4` picks one for a run).
 
@@ -358,10 +364,12 @@ choices and starts the game again, so progress since your last save is lost.
   `hookshot_log.txt` lists every card as `vk: device <n>`; `RX_VK_DEVICE=<n>` chooses one for a single run and wins
   over the menu.
 - **Frame generation** makes extra frames between the game's own. It adds a little input delay, and fast motion can
-  show artifacts. **Frame pacing** shows frames at an even interval: less stutter, up to one frame of delay.
+  show artifacts. At 2x, AMD FSR 3.1's frame interpolation can make the frame (**Frame generation method**, above); at
+  3x and more FSR 3.1 is passed over. **Frame pacing** shows frames at an even interval: less stutter, up to one frame of delay.
 - **The scaling rows**, in the picture's order: **Output resolution** is the size of the game's whole frame, HUD
-  included. The **Upscaler** fills it from the 3D: the game's own network, or NVIDIA DLSS or DLAA (the 3D at full size,
-  edges smoothed). Both look softer than the game's own: set **Sharpness** to around 80% with them. **DLSS model**
+  included. The **Upscaler** fills it from the 3D: the game's own network, NVIDIA DLSS or DLAA (the 3D at full size,
+  edges smoothed), or AMD FSR 3.1 or FSR 4 (below). DLSS and DLAA look softer than the game's own: set **Sharpness** to around
+  80% with them. **DLSS model**
   chooses their network (below). **Render
   resolution** is the 3D's share of the output. The **Window scaling filter** then scales the frame to your window,
   and **Sharpness** sharpens it, by the picture's pixels: when the window is much larger than the picture (the Handheld
@@ -566,6 +574,20 @@ cd ~/Games/Hookshot
 ```
 
 `hookshot_env.txt` and the other test switches are documented below.
+
+<details>
+<summary>AMD FSR 3.1 (every build)</summary>
+
+**AMD FSR 3.1** in the Graphics tab's **Upscaler** row (`dlss=3` in `hookshot_options.ini`; `RX_VK_FSR=1` for one run,
+`RX_VK_FSR=0` never) upscales in place of the game's own network, and with **Frame generation** at 2x its frame
+interpolation makes the frame in between (`RX_VK_FSR_FG=0` leaves that to the renderer's own). Both are AMD's FidelityFX
+SDK 1.1.4 shaders (`third_party/fidelityfx-sdk`, MIT), compiled into the renderer: no AMD runtime or DLL is needed, and
+the row offers FSR 3.1 on any Vulkan 1.3 GPU with push descriptors, extended storage image formats and storage writes
+without a format (`vk: fsr3: ... can run on this GPU` in the log). Its inputs are the scene's colour, its depth, motion
+from the camera, and the same camera jitter DLSS uses (`RX_VK_FSR_JITTER=0` turns it off); things that move by
+themselves can trail for now. (This fork: `dlss=4` is AMD FSR 4, from the same inputs, on Windows.)
+
+</details>
 
 <details>
 <summary>NVIDIA DLSS (optional, NVIDIA's SDK under NVIDIA's license)</summary>

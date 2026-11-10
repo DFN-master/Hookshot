@@ -1,8 +1,58 @@
 # Upscaling and frame generation
 
-This is a plan, not a description of what the renderer does today. It names the integration point,
-the input contract, the licensing rules each vendor runtime imposes, and the order the work can land
-in. Nothing here is implemented yet; each section below is one pull request.
+Most of this file is the record of how the upscalers got here: the plan it started as, and the corrections the runs made
+to it. What the renderer does today is the section right below; where an older section disagrees with it, the older
+section is history and says so.
+
+## How it is wired now
+
+AMD FSR 3.1 is upstream's implementation (NotRexed/Hookshot#1386, `pr/fsr3-upscale-framegen`), taken over this fork's
+own earlier one, with the fork's AMD FSR 4 and DLSS frame generation put on the same inputs.
+
+**One place makes every input.** `gpu/vk/vk_fsr3_inputs.cpp` `prepare()`, at the gameplay upscale's dispatch (the one
+NVIDIA DLSS takes, found the same way: `fsr3_stand_in` in `vk_draw.cpp`, before `dlss_stand_in`), makes one `Frame` at
+the render size with one pass (`shaders/fsr3_prep.comp`):
+
+- **Colour:** the network's input as the network samples it (its square-root encoding), clamped to 0..1, NaN set to 0.
+  The upscaler's picture is squared back into the network's output by `dlss_out.comp`, the pass DLSS's picture goes
+  through, for FSR 3.1 and FSR 4 alike.
+- **Depth:** the scene's depth is 0 at the near plane (NVN's -1..1 clip depth, not reversed). FSR's passes are compiled
+  for reversed depth, so the copy is `1 - d`, and the factors that turn it into a view distance come from the projection
+  the scene is drawn with (`fsr3_math.h`, checked by `tests/test_fsr3_math.cpp`): near 0.1, far 1000.5, a 45 degree
+  field of view, read from the camera's uniform buffer as `dlss_note_scene_draw` reads it.
+- **Jitter:** #841's, the one jitter in the game (`nx2/oot_jitter.py`, installed in every standalone lift now, and
+  `host/rx_backend.c hos_dlss_jitter_clip`), on while DLSS, FSR 3.1 or FSR 4 draws, read back from the projection.
+- **Motion:** the camera's, from the depth, with `dlss_prep.comp`'s math (this frame's jittered clip space to the frame
+  before's without its jitter), in render pixels. What moves by itself has the motion of what is behind it until #1008's
+  actor motion is shared.
+
+**Who takes them.** FSR 3.1's upscaler (`vk_fsr3.cpp`) and its frame interpolation (`vk_fsr3fi.cpp`); in this fork also
+AMD FSR 4 through AMD's runtime (`vk_ffx.cpp`: the same images, with `FFX_UPSCALE_ENABLE_DEPTH_INVERTED` set because the
+copy is reversed and `DEPTH_INFINITE` only for an infinite projection, which this game's is not), and NVIDIA DLSS frame
+generation (`vk_framegen.cpp dlssg_frames`: `DepthInverted` now true of the depth it is given, the planes and the field
+of view from the same projection, and the clip-to-previous-clip pair the motion was made with).
+
+**Frame generation** (`vk_framegen.cpp`, the method row in `framegen_methods.h`): at 2x to 8x Auto tries DLSS frame
+generation, then FSR 4's, then FSR 3.1's, then the renderer's own blend; a method chosen outright is tried alone. FSR 3.1's
+interpolation has no phase (AMD's `ffx_frameinterpolation.h` fixes t at 0.5), so it makes 2x sets only
+(`framegen_methods::makes_set`): this fork used to repeat its one midpoint for every made frame of a 3x or 4x set, which
+shows the same picture at two different times and judders. Each present's inputs are taken once (`fsr3_inputs::take`), so
+no present interpolates with another frame's depth and motion.
+
+**What the port fixed** in the fork's version:
+
+- the camera hook (`nx2/oot_camera.py`, `host/hos_oot_camera.c`) published sead's projection object, near 1.0 and far
+  20000, not the projection the scene is drawn with, and FSR was given reversed-infinite factors for a depth that is
+  neither: gone, the camera comes from the projection;
+- FSR's picture was blitted into the network's output without undoing the network's square-root encoding;
+- the FSR files did not include `vk_work.h`, so `full_barrier` could leave out a barrier after their work;
+- the camera-motion image never had its first layout transition;
+- on a resize, images frames in flight could still use were destroyed (they are freed a few presents later now).
+
+**What went with it:** the fork's viewport jitter (`vk_draw.cpp` `SceneJitter`, `RX_VK_JITTER`), the camera hook, the
+seam and contract headers (`upscale_seam.h`, `upscale_contract.h`, `upscale_format.h`) and their tests, the per-network
+log's contract roles, `RX_VK_FSR_STAGE`, `RX_VK_VP_HUNT` and `DescWriter::Source`. `vk_camera_motion.cpp` and
+`scene_frame_inputs()` stay for the open neural rendering backend (`vk_opennr.cpp`), which nothing here changes.
 
 ## What exists today
 
@@ -12,7 +62,7 @@ in. Nothing here is implemented yet; each section below is one pull request.
 | `upscale` | `gpu/vk/vk_menu.h`, `framegen_scale` | A spatial filter on the finished window image: off, Catmull-Rom, Lanczos |
 | Frame generation | `gpu/vk/vk_framegen.cpp` | Image-space interpolation: quarter-size luma, 16x16 block matching within +-32 px, a 3x3 median, then a forward/backward blend per made frame |
 | The game's own upscaler | `taau_stand_in`, `gpu/vk/vk_draw.cpp` | OoT evaluates a neural TAAU network (program `fd029a317a9a4b94`). Where the device has no hardware f16 matrix multiply (or with `RX_VK_NO_F16`), a compute stand-in replaces it, because the translated network loses the blue channel and casts the scene yellow; elsewhere the network itself runs. `RX_VK_TAAU_KEYS` overrides either way |
-| The per-network log | `gpu/vk/vk_draw.cpp`, `gpu/vk/upscale_contract.h` | Once per network key: its dispatch size, its sampled textures, what each one is in the input contract below, and whether a temporal upscaler could stand in |
+| The per-network log | `gpu/vk/vk_draw.cpp` | Once per network key: its dispatch size and its sampled textures |
 
 Two consequences follow from that table, and they decide the whole design.
 
@@ -99,6 +149,10 @@ ordered replay, never from live guest memory.
 
 ## The camera, read out of the game rather than guessed
 
+> **Superseded.** The hook this section describes is gone. It published sead's projection object (near 1.0, far 20000),
+> which is not the projection the scene is drawn with: that one, read from the camera's uniform buffer, has the near
+> plane at 0.1 and the far plane at 1000.5 (`p22 -1.0002, p23 -0.20002`). See "How it is wired now" above.
+
 FSR's `device_to_view_depth` and `tan_half_fov` want the near plane and the vertical field of view,
 and camera-derived motion wants the view-projection. Both are available: sead's perspective
 projection object carries them, and its matrix update is already a patch site (`nx2/oot_wide.py`,
@@ -162,6 +216,9 @@ data camera-derived motion needs.
 
 ## The input contract
 
+> **History.** `upscale_contract.h`, `upscale_format.h` and their test are gone: the inputs are made in one place now
+> (`vk_fsr3_inputs.cpp`), not classified out of the dispatch's bindings.
+
 A temporal upscaler needs the network's own inputs, and it must only run when they are all present and
 of the expected shape:
 
@@ -192,7 +249,9 @@ inputs it has guessed produces ghosting that looks like a renderer bug and is re
 
 ## The seam
 
-`gpu/vk/upscale_seam.h` is where a backend is chosen. The renderer resolves a recognized dispatch once into an
+> **History.** `upscale_seam.h` is gone with the contract; FSR takes the dispatch the way DLSS does (`fsr3_stand_in`).
+
+`gpu/vk/upscale_seam.h` was where a backend was chosen. The renderer resolves a recognized dispatch once into an
 `upscale::Request` — what the sampled bindings provide, the image the dispatch writes, and which binding the renderer
 is going to hand over as colour — and `choose()` says which backend takes it. A backend never re-derives the dispatch
 for itself.
@@ -374,10 +433,10 @@ looking at:
    the shader's idea of the flow extent equal the image it is given. Where the display size is not
    a multiple of 8 the shader's integer divide floors while we allocate the ceiling, so it addresses
    inside the image rather than past it, which is the safe direction.
-2. **A count above one repeats a frame.** FSR 3.1 interpolates the midpoint and only the midpoint --
-   no phase in its constants, and its own header writes `t = 0.5` outright -- so `RX_VK_FSR_FG=2`
-   copies the one made frame rather than making two. DLSS's `MultiFrameCount` is the only route to
-   more than one real made frame.
+2. **A count above one repeated a frame.** FSR 3.1 interpolates the midpoint and only the midpoint --
+   no phase in its constants, and its own header writes `t = 0.5` outright -- so a 3x set copied the
+   one made frame rather than making two, and showed one picture at two times. It makes 2x sets only
+   now (`framegen_methods::makes_set`), and `RX_VK_FSR_FG` is 0 (never) or 1 (over the row).
 3. **A reset frame reports failure** although the chain is recorded, so the caller's own
    interpolation takes it rather than a blend against a black previous source. The SDK returns OK
    there; this is a deliberate difference.
@@ -391,6 +450,9 @@ looking at:
    the SDK's leftovers. Each is commented where it is.
 
 ## The jitter, and why the renderer supplies it
+
+> **Superseded.** The viewport jitter below is gone. #841's jitter (`nx2/oot_jitter.py`) offsets the projection where the
+> game writes it, for every view of the picture's ratio, and costs nothing per draw; DLSS and both FSRs use it.
 
 Neither upscaler had one, and there is none to extract. `capture_view_projection` refuses any
 projection whose m02 is not exactly zero, and it finds one -- so the matrix the game hands its own
@@ -412,6 +474,9 @@ upscaler still on, which is the comparison worth having; the sign convention is 
 first if the image looks wrong, because a wrong sign there is soft or shimmering rather than broken.
 
 ## The settings a player actually sees
+
+> **History.** The rows are the Upscaler (the game's own, DLSS, DLAA, FSR 3.1, FSR 4: `upscaler_rows.h`), Frame
+> generation and the Frame generation method (`framegen_methods.h`) now; the Window scaling filter is a row of its own.
 
 None of this has a switch of its own in the menu. It is the two rows that were already there, which
 is the point: a player asking "what makes the picture bigger" should find one answer, not a filter
@@ -493,9 +558,10 @@ Three things the integration depends on, each from AMD's own sources rather than
   `UNORDERED_ACCESS` are `GENERAL` there. `COMPUTE_READ` -- the obvious choice for an input -- is
   `SHADER_READ_ONLY_OPTIMAL`, and would have the runtime transition from a layout the image is not in. So inputs are
   `GENERIC_READ` and outputs `UNORDERED_ACCESS`.
-- **The inputs are FSR 3.1's.** Jitter and motion in render pixels with a scale of 1, reversed depth with an infinite far
-  plane (`DEPTH_INVERTED | DEPTH_INFINITE`), an HDR scene with automatic exposure. They are exactly what `vk_fsr3.cpp`
-  hands the same upscaler's sources, so the two backends are given the same picture.
+- **The inputs are FSR 3.1's** (`vk_fsr3_inputs.h` `Frame`). Jitter and motion in render pixels with a scale of 1, the
+  depth reversed (`DEPTH_INVERTED`) with the scene's finite far plane (`DEPTH_INFINITE` only for an infinite projection:
+  it used to be set always, for a depth that was neither reversed nor infinite), the colour as FSR 3.1's passes take it
+  with automatic exposure, and the picture squared back by the same pass. The two backends are given the same picture.
 - **Frame generation is dispatched by hand.** AMD's frame generation is built around replacing the application's
   swapchain with AMD's own, which paces the presents. Hookshot presents and paces its own made frames
   (`vk_framegen.cpp`), so it configures the context with no swapchain and dispatches `PrepareV2` and the generation
@@ -547,8 +613,13 @@ refuses, or makes fewer frames than were asked for, the interpolation runs exact
 set is never shown half made. `RX_VK_DLSSG=<1-3>` asks for it and says how many frames to make;
 without it nothing is loaded and nothing is logged.
 
+> **Changed.** Its inputs are FSR 3.1's now (`vk_fsr3_inputs.h`), taken once a present: the reversed depth copy (so
+> `DepthInverted` is true of what it is given; before, it was set for the scene's own depth, which is not reversed), the
+> motion without the jitter, and the matrices and planes of the projection the scene is drawn with. The paragraph below
+> is how it was.
+
 The inputs it needs that colour interpolation does not -- the scene's depth, and the matrix its
-draws used -- are kept by the draw path and read back through `scene_frame_inputs()`, because frame
+draws used -- were kept by the draw path and read back through `scene_frame_inputs()`, because frame
 generation is recorded at present time where neither is otherwise in reach. The motion is the same
 camera-only reprojection the upscalers use, and asking for it twice in one frame is answered with
 the one already written: recording it again would reproject through the matrix the first recording
@@ -605,7 +676,6 @@ Two switches, both off by default, both neutral while off:
 | | |
 |---|---|
 | `RX_VK_DLSSG=<1-3>` | asks for DLSS frame generation and says how many frames to make between two of the game's. Without it nothing is loaded, nothing is looked at and nothing is logged; the renderer's own interpolation is unaffected either way |
-| `RX_VK_FSR_STAGE=<0-3>` | diagnostics, and wrong output on purpose above 0: how far down the upscale path a run goes. 1 stops before the backend, 2 records every barrier, clear and descriptor but none of the nine dispatches, 3 keeps the dispatches and drops the blit into the game's target. It exists because three hypotheses about a frame-rate cost were each disproved by a measurement that a stage switch would have given in one run |
 | `RX_VK_DLSS=1` | asks for the backend at run time. Without it nothing is loaded, nothing is looked at and nothing is logged |
 | `RX_VK_DLSS_SDK` | a **build-time** gate. Off, the NGX half of the backend is not compiled and `supported()` is false. On, the build needs an NGX SDK's `include/` on the include path |
 
