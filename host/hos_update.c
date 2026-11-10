@@ -18,6 +18,10 @@ static int safe_tag(const char *s) {
 }
 #endif
 
+#ifndef HOOKSHOT_REPOSITORY
+#define HOOKSHOT_REPOSITORY "NotRexed/Hookshot"
+#endif
+
 #ifdef _WIN32
 #include "hos_paths.h"
 #include <windows.h>
@@ -29,9 +33,6 @@ static int safe_tag(const char *s) {
 
 /* (hookshot) the repository releases come from, owner/name: nx2/version.py repository(), given by nx2/build.py. A fork's release
    names the fork, so its players are offered the fork's updates */
-#ifndef HOOKSHOT_REPOSITORY
-#define HOOKSHOT_REPOSITORY "NotRexed/Hookshot"
-#endif
 #define HOOKSHOT_WIDEN2(s) L##s
 #define HOOKSHOT_WIDEN(s) HOOKSHOT_WIDEN2(s)
 #define UPDATE_HOST L"api.github.com"
