@@ -21,10 +21,24 @@ docs/weights.md describes, and a synthetic frame, and then lets upstream's own c
 The synthetic weights are drawn so the activations stay alive through all 71 blocks (scaled to each matrix's fan-in,
 with sane skip scales and attention temperatures): equality of all-zero or all-saturated tensors would prove
 nothing, so the harness also measures the boundary references and fails a fixture whose tensors are degenerate.
-This is also what a later AMD port is checked against: the references come from the GLSL route, which is the
-specification.
+This is also what the khr route (gpu/vk/opennr/khr: VK_KHR_cooperative_matrix alone, for AMD's GPUs) is checked
+against. With --khr, a probe (scripts/opennr_khr_probe.cpp, the renderer's own variant table) lists every Vulkan device
+and the khr variants it can run, and each one is run on the same model, frame and fixture, on a device the tool makes
+with nothing but what that route needs (no NV extension; no E4M3 extension for an f16 variant):
+
+4. `dlss5vk parity` with the khr kernels: an exact variant (f16 accumulators, NVIDIA's own MMA) must be bit-exact
+   like every other route; an f32-accumulating one rounds where the network does but cannot promise the hardware's
+   order of adding inside an MMA, so its boundaries are measured against the references instead -- the share of bytes
+   that differ, the distance in E4M3 codes, the largest difference in value, per boundary, and the head's;
+5. `dlss5vk verify` on that device: block 0 kernel by kernel against the CPU reference, under each MMA model,
+   including one of an f32-accumulated step.
+
+llvmpipe (Mesa's CPU driver) lists VK_KHR_cooperative_matrix with 8x8x8 f16 shapes at 8 lanes and no E4M3: the
+closest thing to an RDNA 3 card a PC without one has. It is slow; --khr-device llvmpipe --size 384x256 is minutes.
+Without any GPU that runs upstream's NVIDIA routes, the references come from the first khr run instead, and say so.
 
     python -I -B scripts/opennr_harness.py run [--size 384x256] [--thorough] [--cxx clang++] [--headers DIR]
+            [--khr] [--khr-device NAME] [--khr-variant NAME] [--no-nv-routes]
     python -I -B scripts/opennr_harness.py model DIR [--seed N]     # only the synthetic model directory
 
 Exit 0 when every check passes, 1 on a failure, and 0 with a line starting "SKIP:" when this PC cannot run it (no
@@ -280,6 +294,10 @@ MMA_MODELS = [
     ("Ada's arithmetic (upstream's reference as it is)", []),
     ("one fused group per MMA step (FP8 32 products F24, FP16 16 products F25)",
      ["-DOPENNR_FP8_GROUP=32", "-DOPENNR_FP8_F=24", "-DOPENNR_F16_GROUP=16", "-DOPENNR_F16_F=25"]),
+    # (the khr route's f32-accumulating variants: a step's products and the incoming half summed far more finely than
+    # half, then rounded once. FP16 F26 is as fine as fixedToF16's 32-bit magnitude allows; FP8 F30 is exact in double)
+    ("one finely summed step, as an f32 accumulator (FP8 32 products F30, FP16 16 products F26)",
+     ["-DOPENNR_FP8_GROUP=32", "-DOPENNR_FP8_F=30", "-DOPENNR_F16_GROUP=16", "-DOPENNR_F16_F=26"]),
 ]
 # (the harness-only change to a copy of reference.cpp: the group width and the fraction bits as macros, whose
 # defaults are upstream's numbers, so the first model above compiles to upstream's reference exactly)
@@ -312,9 +330,61 @@ REFERENCE_PATCHES = [
 ]
 
 
+# The tool's own device (vk::Context's default constructor: the renderer adopts its device and never runs this), changed
+# in the harness's copy only: OPENNR_DEVICE picks a device by a part of its name, and OPENNR_KHR=1 makes the device
+# with only what the khr route needs -- VK_KHR_cooperative_matrix, and VK_EXT_shader_float8 when OPENNR_KHR_FLOAT8 is
+# not 0 and the device has E4M3 matrices -- instead of upstream's list (VK_NV_cooperative_matrix2, the CUDA launch, the
+# SM builtins, ...). A khr run that passes on such a device has proved it needs none of them.
+TOOL_PATCHES = [
+    ('#include "vk_context.h"\n',
+     '#include "vk_context.h"\n\n#include <cstdlib>\n\n'
+     'namespace {   // (hookshot harness, scripts/opennr_harness.py TOOL_PATCHES)\n'
+     'const char* hookshotDevice() { const char* e = getenv("OPENNR_DEVICE"); return e && *e ? e : nullptr; }\n'
+     'bool hookshotKhr() { const char* e = getenv("OPENNR_KHR"); return e && atoi(e) != 0; }\n'
+     '}  // namespace\n'),
+    ("    if (coop && fp8) { physical_ = candidate; break; }\n",
+     "    {\n      VkPhysicalDeviceProperties named;\n      vkGetPhysicalDeviceProperties(candidate, &named);\n"
+     "      if (hookshotDevice() && !strstr(named.deviceName, hookshotDevice())) continue;\n    }\n"
+     "    if (coop && (fp8 || hookshotKhr())) { physical_ = candidate; break; }\n"),
+    ("  DeviceRequirements req;\n  VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};\n",
+     "  DeviceRequirements req;\n"
+     "  if (hookshotKhr()) {\n"
+     "    uint32_t n = 0;\n"
+     "    vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, nullptr);\n"
+     "    std::vector<VkExtensionProperties> have(n);\n"
+     "    vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, have.data());\n"
+     "    bool fp8 = !getenv(\"OPENNR_KHR_FLOAT8\") || atoi(getenv(\"OPENNR_KHR_FLOAT8\")) != 0;\n"
+     "    bool fp8Listed = false;\n"
+     "    for (const auto& e : have) fp8Listed = fp8Listed || !strcmp(e.extensionName, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);\n"
+     "    if (fp8 && fp8Listed) {\n"
+     "      VkPhysicalDeviceShaderFloat8FeaturesEXT f8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};\n"
+     "      VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};\n"
+     "      f2.pNext = &f8;\n"
+     "      vkGetPhysicalDeviceFeatures2(physical_, &f2);\n"
+     "      fp8 = f8.shaderFloat8 && f8.shaderFloat8CooperativeMatrix;\n"
+     "    } else {\n"
+     "      fp8 = false;\n"
+     "    }\n"
+     "    req.extensions = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME};\n"
+     "    if (fp8) req.extensions.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);\n"
+     "    req.fp8.pNext = &req.coop;\n"
+     "    req.features.pNext = fp8 ? (void*)&req.fp8 : (void*)&req.coop;\n"
+     "    printf(\"khr device: %s, extensions VK_KHR_cooperative_matrix%s only\\n\", properties.properties.deviceName,\n"
+     "           fp8 ? \" + VK_EXT_shader_float8\" : \"\");\n"
+     "  }\n"
+     "  VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};\n"),
+]
+
+
 def build_tool(work, cxx, headers):
-    """upstream's dlss5vk, once per MMA model: [(model label, executable)]"""
+    """upstream's dlss5vk, once per MMA model: [(model label, executable)]; and the khr probe beside them"""
     src = opennr_kernels.prepare_sources(work / "src")
+    text = (src / "vk_context.cpp").read_text(encoding="utf-8")
+    for old, new in TOOL_PATCHES:
+        if text.count(old) != 1:
+            raise RuntimeError("the harness's device patch no longer matches upstream's vk_context.cpp: " + old[:60])
+        text = text.replace(old, new)
+    (src / "vk_context.cpp").write_text(text, encoding="utf-8")
     text = (src / "reference.cpp").read_text(encoding="utf-8")
     for old, new in REFERENCE_PATCHES:
         if text.count(old) != 1:
@@ -347,6 +417,11 @@ def build_tool(work, cxx, headers):
         if r.returncode:
             raise RuntimeError("linking dlss5vk failed:\n" + r.stdout.decode("utf-8", "replace")[-3000:])
         tools.append((label, exe))
+    r = subprocess.run([cxx, *flags, str(ROOT / "scripts" / "opennr_khr_probe.cpp"), str(obj / "volk_shim.o"), "-o",
+                        str(work / "opennr_khr_probe")] + (["-ldl"] if os.name != "nt" else []),
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if r.returncode:
+        raise RuntimeError("building the khr probe failed:\n" + r.stdout.decode("utf-8", "replace")[-3000:])
     return tools
 
 
@@ -408,12 +483,14 @@ def synthetic_frame(w, h):
     return b"".join(rows)
 
 
-def write_fixture(d, w, h, refs=None, head=None, conditioning=None):
+def write_fixture(d, w, h, refs=None, head=None, conditioning=None, features=None):
     """A proxy fixture for upstream's parity. Without refs: zero placeholders of the right sizes (the bootstrap run,
-    whose dumps become the references)."""
+    whose dumps become the references). With features: those recorded input features instead of the frame."""
     d.mkdir(parents=True, exist_ok=True)
     (fw, fh), _ = geometry(w, h)
-    if not (d / "proxy.f32").is_file():
+    if features:
+        shutil.copyfile(features, d / "features.f32")
+    elif not (d / "proxy.f32").is_file():
         (d / "proxy.f32").write_bytes(synthetic_frame(w, h))
     blocks, transitions = [], []
     for name, (bw, bh, c) in boundaries(w, h).items():
@@ -428,8 +505,10 @@ def write_fixture(d, w, h, refs=None, head=None, conditioning=None):
     (d / "head.f32").write_bytes(head.read_bytes() if head else bytes(fw * fh * 16))
     cond = conditioning or {"localTone": 1.0, "localStructure": 1.0, "skinStructure": 1.0, "style": 0}
     manifest = {"sourceDimensions": [w, h], "fullDimensions": [fw, fh],
-                "proxy": {"width": w, "height": h, "file": "proxy.f32"}, "conditioning": cond, "seed": 1234,
-                "autoMask": True, "checks": ["boundaries", "head"], "blocks": blocks, "transitions": transitions,
+                **({"inputFeatures": {"file": "features.f32"}} if features else
+                   {"proxy": {"width": w, "height": h, "file": "proxy.f32"}, "conditioning": cond, "seed": 1234,
+                    "autoMask": True}),
+                "checks": ["boundaries", "head"], "blocks": blocks, "transitions": transitions,
                 "referenceHead": {"file": "head.f32"}}
     (d / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
 
@@ -477,19 +556,87 @@ ROUTES = [
 ]
 
 
-def tool(exe, kernels, args, env_extra, log):
-    env = {k: v for k, v in os.environ.items() if not k.startswith("DLSS5VK_")}
+def tool(exe, kernels, args, env_extra, log, shaders="shaders"):
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("DLSS5VK_", "OPENNR_KHR", "OPENNR_DEVICE", "HOOKSHOT_OPENNR_"))}
     env.update(env_extra)
     if env_extra.get("DLSS5VK_NO_PTX_MLP"):
         empty = kernels / "no-ptx"
         empty.mkdir(exist_ok=True)
         env["DLSS5VK_PTX_DIR"] = str(empty)
     t = time.time()
-    r = subprocess.run([str(exe), *args, "--shaders", str(kernels / "shaders")], env=env, stdout=subprocess.PIPE,
+    r = subprocess.run([str(exe), *args, "--shaders", str(kernels / shaders)], env=env, stdout=subprocess.PIPE,
                        stderr=subprocess.STDOUT)
     out = r.stdout.decode("utf-8", "replace")
     log.write_text(out, encoding="utf-8")
     return r.returncode, out, time.time() - t
+
+
+# ---- the khr route --------------------------------------------------------------------------------------------
+
+KHR_SUBGROUP = {name: d["KHR_SG"] for name, d, _ in opennr_kernels.KHR_VARIANTS}
+KHR_E4 = {name: bool(d["KHR_E4"]) for name, d, _ in opennr_kernels.KHR_VARIANTS}
+KHR_EXACT = {name: not d["KHR_ACC32"] for name, d, _ in opennr_kernels.KHR_VARIANTS}
+
+
+def probe(work):
+    """[{index, name, nv, subgroups, variants: {variant: "ok" | why not}}] for every Vulkan device"""
+    r = subprocess.run([str(work / "opennr_khr_probe")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    devices = []
+    for line in r.stdout.decode("utf-8", "replace").splitlines():
+        f = line.split("\t")
+        if f[0] == "device" and len(f) >= 6:
+            devices.append({"index": int(f[1]), "name": f[2], "nv": f[4] == "nv=1", "subgroups": f[5][10:],
+                            "variants": {}})
+        elif f[0] == "variant" and len(f) >= 4 and devices:
+            devices[-1]["variants"][f[2]] = f[3]
+    return devices
+
+
+# E4M3 codes as positions on the number line: +-0 are 0, then each code its neighbour's +-1 ("ulps" of E4M3)
+E4_ORDINAL = [(c & 0x7f) * (-1 if c & 0x80 else 1) for c in range(256)]
+E4_VALUE = [(-1 if c & 0x80 else 1) * ((c & 7) / 8 * 2.0 ** -6 if not (c >> 3) & 15 else (1 + (c & 7) / 8) * 2.0 ** (((c >> 3) & 15) - 7))
+            if (c & 0x7f) != 0x7f else 0.0 for c in range(256)]
+
+
+def compare_e4(got, want):
+    """(bytes differing, the largest distance in E4M3 codes, the largest difference in value, values) of two
+    boundaries. Compared in 4 KiB slices first: the equal ones (most) cost one bytes comparison each."""
+    differing, worst, worst_value = 0, 0, 0.0
+    step = 4096
+    for at in range(0, len(want), step):
+        a, b = got[at:at + step], want[at:at + step]
+        if a == b:
+            continue
+        for x, y in zip(a, b):
+            if x != y:
+                differing += 1
+                worst = max(worst, abs(E4_ORDINAL[x] - E4_ORDINAL[y]))
+                worst_value = max(worst_value, abs(E4_VALUE[x] - E4_VALUE[y]))
+    return differing, worst, worst_value, len(want)
+
+
+def compare_head(got, want):
+    """(values differing, largest |difference|, rms of the difference, rms of the reference, non-finite) of two heads"""
+    n = len(want) // 4
+    a, b = struct.unpack("<%df" % n, got[:4 * n]), struct.unpack("<%df" % n, want)
+    differing, worst, sq, ref_sq, bad = 0, 0.0, 0.0, 0.0, 0
+    for x, y in zip(a, b):
+        if not math.isfinite(x):
+            bad += 1
+            continue
+        ref_sq += y * y
+        if x != y:
+            differing += 1
+            worst = max(worst, abs(x - y))
+            sq += (x - y) ** 2
+    return differing, worst, math.sqrt(sq / n), math.sqrt(ref_sq / n), bad, n
+
+
+def khr_env(device, variant):
+    return {**REFERENCE_ROUTE, "OPENNR_KHR": "1", "OPENNR_DEVICE": device["name"],
+            "OPENNR_KHR_FLOAT8": "1" if KHR_E4[variant] else "0",
+            "HOOKSHOT_OPENNR_SUBGROUP_SIZE": str(KHR_SUBGROUP[variant])}
 
 
 def skip_reason(out):
@@ -522,9 +669,33 @@ def run(a):
     try:
         t0 = time.time()
         tools = build_tool(work, cxx, headers)
-        exe = tools[0][1]
         print("built upstream's dlss5vk with %s, its CPU reference in %d MMA models (%.0f s)" %
               (os.path.basename(cxx), len(tools), time.time() - t0), flush=True)
+        devices = probe(work)
+        nv = next((d for d in devices if d["nv"]), None)
+        khr_runs = []
+        if a.khr:
+            print("devices (scripts/opennr_khr_probe.cpp):")
+            for d in devices:
+                print("  %d %s: upstream's NVIDIA routes %s; subgroups %s" %
+                      (d["index"], d["name"], "yes" if d["nv"] else "no", d["subgroups"]))
+                for v, why in d["variants"].items():
+                    print("      khr %-14s %s" % (v, "runs here" if why == "ok" else "no: " + why))
+            for d in devices:
+                if a.khr_device and not any(n.lower() in d["name"].lower() for n in a.khr_device):
+                    continue
+                for v, why in d["variants"].items():
+                    if why == "ok" and (not a.khr_variant or v in a.khr_variant):
+                        khr_runs.append((d, v))
+            if not khr_runs:
+                if not nv:
+                    raise SkipRun("no device here runs the network: no NVIDIA routes and no khr variant%s" %
+                                  (" on a device named %s" % "/".join(a.khr_device) if a.khr_device else ""))
+                print("SKIP (khr): no device here runs a khr variant%s; the NVIDIA routes are checked alone" %
+                      (" (on a device named %s)" % "/".join(a.khr_device) if a.khr_device else ""))
+        if not nv and not khr_runs:
+            raise SkipRun("no device here runs upstream's NVIDIA routes (VK_NV_cooperative_matrix2 + E4M3 matrices)"
+                          "; --khr runs the khr route instead")
         kernels = work / "kernels"
         subprocess.run([sys.executable, "-I", "-B", str(ROOT / "scripts" / "opennr_kernels.py"), "--materialize",
                         str(kernels)], check=True, stdout=subprocess.DEVNULL)
@@ -536,7 +707,7 @@ def run(a):
               (len(manifest["tensors"]), len(manifest["stages"]), size / 2 ** 20, time.time() - t0), flush=True)
         failures = 0
         for w, h in sizes:
-            failures += run_size(tools, kernels, model, work / ("%dx%d" % (w, h)), w, h, a)
+            failures += run_size(tools, kernels, model, work / ("%dx%d" % (w, h)), w, h, a, nv, khr_runs)
         print("\nOPENNR HARNESS: %s" % ("PASS" if not failures else "FAIL (%d)" % failures))
         return 1 if failures else 0
     except SkipRun as e:
@@ -551,7 +722,27 @@ class SkipRun(Exception):
     pass
 
 
-def run_size(tools, kernels, model, d, w, h, a):
+def verify_block0(tools, kernels, model, d, w, h, rows, env, shaders, tag):
+    """block 0 against the CPU reference under every MMA model: [(label, equal, [(kernel, verdict)])]"""
+    (fw, fh), _ = geometry(w, h)
+    results = []
+    for i, (label, variant) in enumerate(tools):
+        code, out, secs = tool(variant, kernels, ["verify", "--model", str(model), "--fixture", str(d / "verify"),
+                                                  "--rows", str(rows)], env, d / ("verify-%s%d.log" % (tag, i)), shaders)
+        checks = re.findall(r"^  (.+?)\s{2,}(equal \(\d+ values\)|MISMATCH.*)$", out, re.M)
+        equal = (not code and len(checks) >= 10 and not any(v.startswith("MISMATCH") for _, v in checks) and
+                 "every kernel of block 0 equals" in out)
+        print("CPU reference with %s, block 0 on %d of %d rows (%.1f s): %s" %
+              (label, min(rows, fw * fh), fw * fh, secs, "EQUAL on every kernel" if equal else "differs"))
+        for name, verdict in checks:
+            print("    %-26s %s" % (name, verdict[:110]))
+        if not checks:
+            print(out[-2000:])
+        results.append((label, equal, checks))
+    return results
+
+
+def run_size(tools, kernels, model, d, w, h, a, nv, khr_runs):
     exe = tools[0][1]
     (fw, fh), _ = geometry(w, h)
     print("\n== %dx%d (field %dx%d)" % (w, h, fw, fh), flush=True)
@@ -559,9 +750,17 @@ def run_size(tools, kernels, model, d, w, h, a):
     boot, dump, fixture = d / "bootstrap", d / "reference", d / "fixture"
     dump.mkdir(exist_ok=True)
     write_fixture(boot, w, h)
-    # 1. the GLSL reference route's own output, the references (its parity against zero placeholders fails by design)
+    # 1. the references: the GLSL reference route's own output on a GPU that runs upstream's routes, else the first
+    # khr run's (its parity against zero placeholders fails by design)
+    if nv:
+        ref_env, ref_shaders, ref_label = {**REFERENCE_ROUTE, "OPENNR_DEVICE": nv["name"]}, "shaders", "GLSL route"
+    else:
+        dev, variant = khr_runs[0]
+        ref_env, ref_shaders = khr_env(dev, variant), opennr_kernels.khr_folder(variant)
+        ref_label = "khr %s on %s -- no GPU here runs upstream's routes, so these references are a khr run's" % (
+            variant, dev["name"])
     code, out, secs = tool(exe, kernels, ["parity", "--model", str(model), "--fixture", str(boot), "--dump", str(dump),
-                                          "--repeat", "2"], REFERENCE_ROUTE, d / "reference.log")
+                                          "--repeat", "2"], ref_env, d / "reference.log", ref_shaders)
     why = skip_reason(out)
     if why:
         raise SkipRun("this GPU or driver cannot run the network: " + why)
@@ -571,8 +770,8 @@ def run_size(tools, kernels, model, d, w, h, a):
         print("FAIL: the reference run produced no references (%d missing)" % len(missing))
         return 1
     stats = re.search(r"head: .*", out)
-    print("reference (GLSL route, %.1f s): %d boundaries and the head recorded; %s" %
-          (secs, len(boundaries(w, h)), stats.group(0) if stats else ""))
+    print("reference (%s, %.1f s): %d boundaries and the head recorded; %s" %
+          (ref_label, secs, len(boundaries(w, h)), stats.group(0) if stats else ""))
     bad = degenerate(dump, w, h)
     if bad:
         print("FAIL: the synthetic network is degenerate, equality would prove little:\n  " + "\n  ".join(bad[:10]))
@@ -585,43 +784,127 @@ def run_size(tools, kernels, model, d, w, h, a):
                                                                                        len(set(values))))
         return 1
     write_fixture(fixture, w, h, refs=dump, head=dump / "head.f32")
+    # (the same references with the reference run's own input features in place of the frame: a khr run on another
+    # device then starts from the same bytes, whatever that device's log and cosine make of the noise lanes)
+    write_fixture(d / "fixture-features", w, h, refs=dump, head=dump / "head.f32", features=dump / "features.f32")
     failures = 0
-    # 2. block 0, kernel by kernel, against the CPU reference
     features_fixture(d / "verify", w, h, dump / "features.f32", dump / "block-0.u8")
     rows = min(fw * fh, 1 << 18) if a.thorough else 4096   # (the CPU reference is single-threaded: ~40 s a 120k rows)
-    matched = []
-    for i, (label, variant) in enumerate(tools):
-        code, out, secs = tool(variant, kernels, ["verify", "--model", str(model), "--fixture", str(d / "verify"),
-                                                  "--rows", str(rows)], {}, d / ("verify-%d.log" % i))
-        checks = re.findall(r"^  (.+?)\s{2,}(equal \(\d+ values\)|MISMATCH.*)$", out, re.M)
-        equal = (not code and len(checks) >= 10 and not any(v.startswith("MISMATCH") for _, v in checks) and
-                 "every kernel of block 0 equals" in out)
-        print("CPU reference with %s, block 0 on %d of %d rows (%.1f s): %s" %
-              (label, min(rows, fw * fh), fw * fh, secs, "EQUAL on every kernel" if equal else "differs"))
-        for name, verdict in checks:
-            print("    %-26s %s" % (name, verdict[:110]))
-        if equal:
-            matched.append(label)
-        elif not checks:
-            print(out[-2000:])
-    if not matched:
-        print("FAIL: block 0 equals the CPU reference under no MMA model")
-        failures += 1
-    # 3. every route against the references
-    for label, env in ROUTES:
-        code, out, secs = tool(exe, kernels, ["parity", "--model", str(model), "--fixture", str(fixture),
-                                              "--repeat", "3"], env, d / ("parity-%d.log" % ROUTES.index((label, env))))
-        exact = len(re.findall(r"^\S+\s+\d+x\d+x\d+ bit-exact", out, re.M))
-        head_line = re.search(r"head vs reference: (.*)", out)
-        verdict = re.search(r"VERDICT: (.*)", out)
-        gpu = re.search(r"production schedule \(([^)]*)\): (\d+) dispatches, GPU ([\d.]+) ms", out)
-        print("%-46s %s; boundaries bit-exact %d/%d; head %s%s" %
-              (label, verdict.group(1) if verdict else "NO VERDICT", exact, len(boundaries(w, h)),
-               head_line.group(1) if head_line else "?",
-               "; %s, %s dispatches, %s ms GPU (min of 3)" % gpu.groups() if gpu else ""))
-        if code or not verdict or not verdict.group(1).startswith("PASS") or exact != len(boundaries(w, h)):
-            print("\n".join(l for l in out.splitlines() if "MISMATCH" in l or "DIFFERENT" in l or "NOT" in l)[:3000])
+    if nv and not a.skip_routes:
+        # 2. block 0, kernel by kernel, against the CPU reference
+        results = verify_block0(tools, kernels, model, d, w, h, rows, {"OPENNR_DEVICE": nv["name"]}, "shaders", "")
+        if not any(equal for _, equal, _ in results):
+            print("FAIL: block 0 equals the CPU reference under no MMA model")
             failures += 1
+        # 3. every route against the references
+        for label, env in ROUTES:
+            code, out, secs = tool(exe, kernels, ["parity", "--model", str(model), "--fixture", str(fixture),
+                                                  "--repeat", "3"], {**env, "OPENNR_DEVICE": nv["name"]},
+                                   d / ("parity-%d.log" % ROUTES.index((label, env))))
+            exact = len(re.findall(r"^\S+\s+\d+x\d+x\d+ bit-exact", out, re.M))
+            head_line = re.search(r"head vs reference: (.*)", out)
+            verdict = re.search(r"VERDICT: (.*)", out)
+            gpu = re.search(r"production schedule \(([^)]*)\): (\d+) dispatches, GPU ([\d.]+) ms", out)
+            print("%-46s %s; boundaries bit-exact %d/%d; head %s%s" %
+                  (label, verdict.group(1) if verdict else "NO VERDICT", exact, len(boundaries(w, h)),
+                   head_line.group(1) if head_line else "?",
+                   "; %s, %s dispatches, %s ms GPU (min of 3)" % gpu.groups() if gpu else ""))
+            if code or not verdict or not verdict.group(1).startswith("PASS") or exact != len(boundaries(w, h)):
+                print("\n".join(l for l in out.splitlines() if "MISMATCH" in l or "DIFFERENT" in l or "NOT" in l)[:3000])
+                failures += 1
+    # 4./5. the khr route, on every device and variant asked for
+    for dev, variant in khr_runs:
+        failures += run_khr(tools, kernels, model, d, w, h, a, dev, variant, rows, dump)
+    return failures
+
+
+# What a khr variant is held to. An exact one (f16 accumulators: NVIDIA's own MMA) must give the references' bytes, as
+# every upstream route does. An f32-accumulating one rounds every step where the network does, and its f16 GEMMs and
+# its half fma, reciprocal and inverse square root are exact integer / f32 arithmetic (khr/gemm_f16.comp,
+# khr/khr_numerics.glsl), so what is left to the hardware is only how its MMA adds a step's products in f32. Measured:
+# on an RTX 5060 Ti and on llvmpipe that left nothing -- bit-exact at every boundary. On other hardware an MMA that
+# adds in another order may put a sum on the other side of a half's rounding boundary, rarely, and a synthetic network
+# of random weights then carries that difference on (by block 14 most bytes differ: what one ulp anywhere does to it,
+# not a measure of the route). So such a variant passes as "bit-exact", or as "close" when block 0, kernel by kernel on
+# its own inputs, equals the CPU reference's finely summed model in all but KHR_KERNEL_MAX_SHARE of the values; the
+# boundaries' distribution is printed and written either way.
+KHR_KERNEL_MAX_SHARE = 1e-4
+
+
+def run_khr(tools, kernels, model, d, w, h, a, dev, variant, rows, dump):
+    exe = tools[0][1]
+    label = "khr %s on %s" % (variant, dev["name"])
+    out_dir = d / ("khr-%d-%s" % (dev["index"], variant))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    env, shaders = khr_env(dev, variant), opennr_kernels.khr_folder(variant)
+    print("\n-- %s" % label, flush=True)
+    code, out, secs = tool(exe, kernels, ["parity", "--model", str(model), "--fixture", str(d / "fixture-features"),
+                                          "--repeat", "2", "--dump", str(out_dir)], env, out_dir / "parity.log", shaders)
+    device_line = re.search(r"khr device: (.*)", out)
+    gpu = re.search(r"production schedule \(([^)]*)\): (\d+) dispatches, GPU ([\d.]+) ms", out)
+    verdict = re.search(r"VERDICT: (.*)", out)
+    exact = len(re.findall(r"^\S+\s+\d+x\d+x\d+ bit-exact", out, re.M))
+    print("%s (%.0f s): %s; %s" % (label, secs, device_line.group(1) if device_line else "NO KHR DEVICE",
+                                   "%s dispatches, %s ms GPU (min of 2)" % gpu.groups()[1:] if gpu else "no timing"))
+    if not device_line or "head over 2 production submissions: DIFFERENT" in out:
+        print(out[-3000:])
+        print("FAIL: %s did not run on a khr-only device, or was not repeatable" % label)
+        return 1
+    missing = [n for n in boundaries(w, h) if not (out_dir / (n + ".u8")).is_file()]
+    if missing or not (out_dir / "head.f32").is_file():
+        print(out[-3000:])
+        print("FAIL: %s produced %d of %d boundaries%s" % (label, len(boundaries(w, h)) - len(missing),
+                                                          len(boundaries(w, h)),
+                                                          "" if (out_dir / "head.f32").is_file() else " and no head"))
+        return 1
+    failures = 0
+    rows_out, exact_count, first = [], 0, None
+    for name, (bw, bh, c) in boundaries(w, h).items():
+        diff, worst, worst_value, n = compare_e4((out_dir / (name + ".u8")).read_bytes(), (dump / (name + ".u8")).read_bytes())
+        rows_out.append((name, diff, worst, worst_value, n))
+        exact_count += diff == 0
+        if diff and first is None:
+            first = name
+    hd = compare_head((out_dir / "head.f32").read_bytes(), (dump / "head.f32").read_bytes())
+    with open(out_dir / "compare.txt", "w", encoding="utf-8") as f:
+        f.write("%s against the references (%dx%d)\n" % (label, w, h))
+        f.write("%-18s %10s %9s %6s %10s\n" % ("boundary", "bytes", "differ %", "codes", "max |d|"))
+        for name, diff, worst, worst_value, n in rows_out:
+            f.write("%-18s %10d %9.4f %6d %10.4g\n" % (name, n, 100.0 * diff / n, worst, worst_value))
+        f.write("head: %d of %d values differ, max |d| %.4g, rms of the difference %.4g (reference rms %.4g), "
+                "non-finite %d\n" % (hd[0], hd[5], hd[1], hd[2], hd[3], hd[4]))
+    print("boundaries bit-exact %d/%d%s; head: %d of %d values differ (%.2f%%), max |d| %.4g, rms of the difference "
+          "%.4g against a reference rms of %.4g, non-finite %d" %
+          (exact_count, len(rows_out), "" if first is None else ", the first difference at " + first,
+           hd[0], hd[5], 100.0 * hd[0] / max(1, hd[5]), hd[1], hd[2], hd[3], hd[4]))
+    shown = [r for r in rows_out if r[0] in ("block-0", "transition-0-1", "block-4", "block-14", "block-22", "block-30",
+                                              "block-38", "block-47", "block-55", "block-61", "block-65", "block-69")]
+    print("    " + "  ".join("%s %.3g%%/%d" % (r[0], 100.0 * r[1] / r[4], r[2]) for r in shown) +
+          "   (bytes differing / most codes apart; every boundary: %s)" % (out_dir / "compare.txt"))
+    # 5. block 0 against the CPU reference, on this device with these kernels
+    results = verify_block0(tools, kernels, model, d, w, h, rows, env, shaders, "khr-%d-%s-" % (dev["index"], variant))
+    bit_exact = exact_count == len(rows_out) and not hd[0] and verdict and verdict.group(1).startswith("PASS")
+    if bit_exact:
+        print("%s: bit-exact with the references" % label)
+    elif KHR_EXACT[variant]:
+        print("FAIL: %s is an exact variant and is not bit-exact with the references" % label)
+        failures += 1
+    else:
+        def share(verdict_text):
+            m = re.match(r"MISMATCH (\d+)/(\d+)", verdict_text)
+            return int(m.group(1)) / int(m.group(2)) if m else 0.0
+        fine = results[-1][2]   # (the finely summed model: MMA_MODELS' last)
+        kernel_ok = bool(fine) and all(share(v) <= KHR_KERNEL_MAX_SHARE for name, v in fine if name != "block-0 vs fixture")
+        if hd[4] or not kernel_ok:
+            print("FAIL: %s: not bit-exact, and block 0's kernels differ from the CPU reference in more than %.2g of "
+                  "their values (or the head is not finite)" % (label, KHR_KERNEL_MAX_SHARE))
+            failures += 1
+        else:
+            print("%s: close -- block 0's kernels equal the CPU reference in all but %.2g of their values; the "
+                  "boundaries' distribution is above" % (label, KHR_KERNEL_MAX_SHARE))
+    if not any(equal for _, equal, _ in results) and (bit_exact or KHR_EXACT[variant]):
+        print("FAIL: %s: block 0 equals the CPU reference under no MMA model" % label)
+        failures += 1
     return failures
 
 
@@ -636,6 +919,11 @@ def main():
     r.add_argument("--seed", type=int, default=1)
     r.add_argument("--work", help="keep everything in this folder")
     r.add_argument("--keep", action="store_true", help="do not delete the temporary folder")
+    r.add_argument("--khr", action="store_true", help="also the khr route, on every device and variant the probe finds")
+    r.add_argument("--khr-device", action="append", help="only devices whose name has this in it (repeatable)")
+    r.add_argument("--khr-variant", action="append", help="only this khr variant (repeatable)")
+    r.add_argument("--skip-routes", action="store_true",
+                   help="not upstream's NVIDIA routes' checks (the references still come from its GLSL route)")
     m = sub.add_parser("model")
     m.add_argument("directory")
     m.add_argument("--seed", type=int, default=1)

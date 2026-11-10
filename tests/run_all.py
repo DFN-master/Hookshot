@@ -90,6 +90,7 @@ ARGS = {
     "tests/test_astc_bc_policy.py": ["--cxx", "g++"],
     "tests/test_opennr_kernels.py": ["--glslang", "{glslang}", "--spirv-val", "{spirv_val}"],
     "tests/test_opennr_harness.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
+    "tests/test_opennr_khr.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
 }
 
 # Python packages some tests import (CI installs them; the runner itself needs none)
@@ -125,6 +126,7 @@ SKIP["tests/test_fsr3_shaders.py"] = ({"windows"}, "needs glslang: checked on Li
 SKIP["tests/test_opennr_kernels.py"] = ({"windows"}, "needs glslang: checked on Linux")
 # (it builds upstream's tool with the system's C++ library and runs it on the GPU, which says SKIP without one)
 SKIP["tests/test_opennr_harness.py"] = ({"windows"}, "builds and runs OpenDLSS-NR's tool: checked on Linux")
+SKIP["tests/test_opennr_khr.py"] = ({"windows"}, "builds and runs OpenDLSS-NR's tool: checked on Linux")
 
 
 def which(*names):

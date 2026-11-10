@@ -3,8 +3,9 @@
 // includes it. The two cannot meet in one translation unit: upstream's code calls Vulkan through the volk shim
 // (gpu/vk/opennr/volk.h), the renderer through vkx (vk_loader.h), and both spell the functions the same.
 //
-// This is also the seam an AMD port replaces: everything here is upstream's kernels on upstream's buffers, and the
-// renderer's side only hands it a device and reads two buffers back (docs/neural-rendering.md, "An AMD route").
+// The renderer's side only hands it a device and reads two buffers back, whatever kernels run behind it: upstream's
+// (the Fast, Glsl and Reference routes, NVIDIA-only) or the khr route's (gpu/vk/opennr/khr, VK_KHR_cooperative_matrix
+// alone: AMD and the rest), which run upstream's unfused graph on kernels of their own (docs/neural-rendering.md).
 //
 // Nothing here throws: upstream's code reports with exceptions, which are caught at this boundary and come back as
 // text. Nothing here reads or writes the frame; the renderer's two passes do (gpu/vk/shaders/opennr_*.comp).
@@ -42,6 +43,7 @@ enum class Route {
     Fast,        ///< upstream's default: PTX through VK_NV_cuda_kernel_launch, counter chaining
     Glsl,        ///< the fused GLSL kernels only (every DLSS5VK_PTX_* off): no CUDA launch needed
     Reference,   ///< the least fused GLSL route (DLSS5VK_UNFUSED=1): every intermediate materialized, up to 2560x1440
+    Khr,         ///< upstream's unfused graph on the khr kernels (gpu/vk/opennr/khr): no NV extension at all
 };
 
 /// What a build for one size gives the renderer: the f32 [full rows][16] input it writes and the f32 [full rows][4]
@@ -57,10 +59,11 @@ struct Built {
 class Network;
 
 /// Loads the model (already checked: its hashes are not computed again) and the kernels from `kernel_dir`
-/// (shaders/*.spv and ptx/*.ptx). Submits uploads on the device's queue and waits for them: the caller holds whatever
-/// lock that queue takes. Null and `error` on failure.
+/// (shaders/*.spv and ptx/*.ptx; for the khr route shaders-khr-<khr_variant>/*.spv, a name of opennr_khr.h kVariants).
+/// Submits uploads on the device's queue and waits for them: the caller holds whatever lock that queue takes. Null and
+/// `error` on failure.
 [[nodiscard]] Network* create(const Device& device, const std::string& model_dir, const std::string& kernel_dir,
-                              Route route, std::string* error);
+                              Route route, const char* khr_variant, std::string* error);
 /// The graph for a frame of w x h, recorded once into a secondary command buffer that record() then executes every
 /// frame (nothing is allocated per frame). The previous size's graph is released: the device must be idle. The first
 /// build compiles every pipeline and JITs every PTX module, which is most of a second.
