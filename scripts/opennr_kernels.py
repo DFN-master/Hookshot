@@ -355,6 +355,24 @@ def strip_generator(text):
             if not line.strip().startswith("// ") or not line.strip()[3:].replace(".", "").isdigit()]
 
 
+# (modules a spirv-val older than their extensions could not read: said once at the end, not a failure)
+UNKNOWN_TO_VALIDATOR = []
+
+
+def validate(spirv_val, spv, what):
+    """spirv-val on one module. A validator that does not know a capability the module declares (a distribution's
+    spirv-tools from before SPV_EXT_float8: "Invalid capability operand: 4212") has not found the module wrong, it could
+    not read it: that module is listed and left unvalidated. Anything else it says is an error."""
+    r = subprocess.run([spirv_val, "--target-env", "vulkan1.3", str(spv)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if not r.returncode:
+        return
+    out = r.stdout.decode("utf-8", "replace")
+    if "Invalid capability operand" in out or "Invalid extension" in out:
+        UNKNOWN_TO_VALIDATOR.append(what)
+        return
+    raise RuntimeError("spirv-val refused %s:\n%s" % (what, out))
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--glslang", default=None, help="glslangValidator; found on PATH by default")
@@ -398,7 +416,7 @@ def main():
             spv = Path(tmp) / (name + ".spv")
             compile_kernel(glslang, name, spv)
             if a.spirv_val:
-                subprocess.run([a.spirv_val, "--target-env", "vulkan1.3", str(spv)], check=True)
+                validate(a.spirv_val, spv, name)
             modules.append((name, words_of(spv)))
         made = kernel_header(modules)
         khr_modules = compile_khr(glslang, tmp)
@@ -406,10 +424,7 @@ def main():
             for entry, words in khr_modules:
                 spv = Path(tmp) / "val.spv"
                 spv.write_bytes(b"".join(w.to_bytes(4, "little") for w in words))
-                r = subprocess.run([a.spirv_val, "--target-env", "vulkan1.3", str(spv)], stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT)
-                if r.returncode:
-                    raise RuntimeError("spirv-val refused khr %s:\n%s" % (entry, r.stdout.decode("utf-8", "replace")))
+                validate(a.spirv_val, spv, "khr %s" % (entry,))
         khr_made = khr_header(khr_modules)
         if a.check:
             have = khr_header_words(KHR_HEADER.read_text(encoding="utf-8")) if KHR_HEADER.is_file() else {}
@@ -444,7 +459,7 @@ def main():
                 spv = Path(tmp) / (name + ".spv")
                 subprocess.run([glslang, "-V", "--quiet", "-S", "comp", "--target-env", "vulkan1.3", "-o", str(spv),
                                 str(src)], check=True)
-                subprocess.run([a.spirv_val, "--target-env", "vulkan1.3", str(spv)], check=True)
+                validate(a.spirv_val, spv, name)
             if a.check:
                 have = header.read_text(encoding="utf-8") if header.is_file() else ""
                 if strip_generator(have) != strip_generator(out.read_text(encoding="utf-8")):
@@ -456,6 +471,9 @@ def main():
     if bad:
         print("%d header(s) do not match their source: %s" % (len(bad), ", ".join(bad)), file=sys.stderr)
         return 1
+    if UNKNOWN_TO_VALIDATOR:
+        print("spirv-val here is older than %d module(s)' capabilities and could not read them (not validated): %s" %
+              (len(UNKNOWN_TO_VALIDATOR), ", ".join(UNKNOWN_TO_VALIDATOR[:6]) + (" ..." if len(UNKNOWN_TO_VALIDATOR) > 6 else "")))
     print("opennr kernels: %d kernels, %d khr variants and %d frame passes %s" %
           (len(KERNELS), len(KHR_VARIANTS), len(FRAME_SHADERS), "match" if a.check else "written"))
     return 0
