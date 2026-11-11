@@ -18,18 +18,17 @@
 
 #include <cstdint>
 
+#include "dlssg_math.h"
 #include "vk_internal.h"
 
 namespace mkwvk::dlssg {
 
 /// One evaluation's inputs.
 ///
-/// The colour is the frame the game has just finished, at the size it is presented; the motion and
-/// depth are the scene's, at the render size, with `motion_scale` taking a vector to render pixels
-/// and `depth_inverted` saying which way the depth runs. The two clip matrices are what let the
-/// network place the made frame in time: `clip_to_prev_clip` carries this frame's clip space to the
-/// one before it, and `prev_clip_to_clip` is its inverse. Both are row major, as everywhere else in
-/// this renderer, and are transposed on the way in.
+/// The colour is the frame the game has just finished, at the size it is presented; the motion and depth are the scene's,
+/// at the render size (vk_fsr3_inputs.h Frame: the depth reversed, the motion in render pixels toward the frame before,
+/// without the jitter). The camera is dlssg_math.h's: the scene's matrices as NGX takes them, which is not as the renderer
+/// keeps them (row vectors, the depth image's clip space); `motion_scale` and `jitter` are dlssg_math.h's too.
 struct Inputs {
     VkImageView color = VK_NULL_HANDLE;
     VkImage color_image = VK_NULL_HANDLE;
@@ -44,66 +43,54 @@ struct Inputs {
     VkFormat motion_format = VK_FORMAT_UNDEFINED;
     uint32_t render_width = 0, render_height = 0;
 
-    float motion_scale[2]{1.0f, 1.0f};
-    float jitter[2]{};
-    float clip_to_prev_clip[16]{};
-    float prev_clip_to_clip[16]{};
-    /// The rest of the set NGX's own helper sets. An evaluation with only the two above is refused
-    /// with NVSDK_NGX_Result_FAIL_MissingInput, which is what a run saw, so these are not optional
-    /// however optional the struct they live in is called.
-    float camera_view_to_clip[16]{};   ///< the projection
-    float clip_to_camera_view[16]{};   ///< its inverse
-    float clip_to_lens_clip[16]{};     ///< identity here: this game has no lens distortion
-    float camera_pos[3]{};
-    float camera_up[3]{};
-    float camera_right[3]{};
-    float camera_forward[3]{};
-    bool have_matrices = false;
+    float motion_scale[2]{};   ///< normalizes a motion vector (dlssg_math.h motion_scale)
+    float jitter[2]{};         ///< in clip space (dlssg_math.h jitter_to_clip)
+    dlssg_math::Camera camera;
+    /// An evaluation without the whole camera is refused by NGX (NVSDK_NGX_Result_FAIL_MissingInput, which a run saw), so
+    /// one without it is not made here either: generate() answers false
+    bool have_camera = false;
 
     float near_plane = 0.1f;
     float far_plane = 1000.0f;
     float fov_y = 60.0f * 3.14159265358979f / 180.0f;
     float aspect = 16.0f / 9.0f;
     bool depth_inverted = true;
-    bool colour_hdr = true;
+    bool colour_hdr = false;
     /// The motion already includes the camera's movement. Ours does: it *is* the camera's movement
     /// (gpu/vk/vk_fsr3_inputs.h, shaders/fsr3_prep.comp), which is why this defaults true and why
     /// saying otherwise would have the network apply the camera twice.
     bool camera_motion_included = true;
     bool reset = false;
 
-    /// How many frames to make between this one and the last, and which of them this evaluation is
-    /// (1-based). 1 and 1 is ordinary 2x generation; a count of 2 or 3 is what DLSS 4 calls
-    /// multi-frame generation, and needs an evaluation per made frame.
+    /// How many frames are made between this frame and the last (1 to max_frames()), and which of them this evaluation is
+    /// (1-based). 1 and 1 is ordinary 2x generation; more is DLSS 4's multi-frame generation, an evaluation a made frame.
     uint32_t frames_made = 1;
     uint32_t frame_index = 1;
 };
 
-/// Whether frame generation can run here at all: asked for (`RX_VK_DLSSG=1`), built with an NGX SDK,
-/// the NGX runtime loaded, and this driver and GPU reporting Frame Generation. Asked once; the one
-/// line saying why it is false is logged once.
+/// Whether frame generation can run here at all: built with an NGX SDK, the NGX session up, this driver and GPU reporting
+/// Frame Generation, and RX_VK_DLSSG not 0. NGX is asked once (and may take seconds to start: vk_menu.cpp asks during the
+/// start-up screen, so the Insert menu and the first frame only read the answer); the one line saying why not is logged
+/// once. It does not depend on the Frame generation row: the method row offers what runs.
 [[nodiscard]] bool supported();
+
+/// The most frames it makes between two of the game's: NGX's own limit for this GPU (DLSSG.MultiFrameCountMax: 1 without
+/// multi-frame generation, 3 with it), under RX_VK_DLSSG=<1-3> when that is set. 0 where it is not supported(). A set of
+/// more made frames than this is not its to make (framegen_methods.h makes_set).
+[[nodiscard]] uint32_t max_frames();
 
 /// The device extensions frame generation needs here, asked of NGX itself before the device exists.
 /// Super resolution's set is not the same set: a device made for one and not the other is where
 /// `NVSDK_NGX_VULKAN_CreateFeature` answers FAIL_PlatformError with the feature still reporting
-/// itself available, which is exactly what a run saw. Returns how many names were written, at most
-/// `max`; zero where frame generation was not asked for, this build has no NGX SDK, or NGX does not
-/// answer. The names are NGX's own storage and last as long as the process.
+/// itself available, which is exactly what a run saw. Asked whatever the Frame generation row says: the device is made
+/// before a player can turn the row on, and a device without these could never run it this session. Returns how many
+/// names were written, at most `max`; zero with RX_VK_DLSSG=0 or RX_VK_DLSS=0 (which leaves NGX off), in a build without
+/// an NGX SDK, or where NGX does not answer. The names are NGX's own storage and last as long as the process.
 size_t device_extensions(VkInstance instance, VkPhysicalDevice gpu, const char** out, size_t max);
 
-/// How many frames the run asks to be made between two of the game's: `RX_VK_DLSSG=<1-3>`, 1 by
-/// default. Zero where frame generation is not asked for at all.
-[[nodiscard]] uint32_t frames_wanted();
-
-/// Makes the images the made frames resolve into and remembers these extents, re-making them when
-/// the extents change. False when anything could not be made, which leaves generation unavailable
-/// rather than half-built.
-[[nodiscard]] bool prepare(uint32_t width, uint32_t height, uint32_t render_width,
-                           uint32_t render_height, VkFormat present_format);
-
-/// Records one made frame. False when the inputs are not usable or NGX refused, which leaves the
-/// caller to show whatever it would otherwise have shown.
+/// Records one made frame, making the feature and the frames' images for these sizes first (again when the sizes, the
+/// presented format or the count change, with the device idle). False when the inputs are not usable or NGX refused,
+/// which leaves the caller to show whatever it would otherwise have shown.
 [[nodiscard]] bool generate(VkCommandBuffer cmd, const Inputs& in);
 
 /// The made frame of the last `generate`, by index (1-based, as `Inputs::frame_index`), or null.

@@ -64,6 +64,9 @@ enum Backend : int { AUTO = 0, STREAMLINE = 1, NGX = 2, OPEN = 3 };   // (OPEN: 
 [[nodiscard]] int asked_backend();
 [[nodiscard]] int running_backend();
 
+/// Whether neural rendering is switched on (the Neural tab's row, or RX_VK_DLSS_NR over it): read live, each frame.
+[[nodiscard]] bool wanted();
+
 /// The present's one call: the running backend's apply.
 [[nodiscard]] VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, VkImageView* out_view);
 

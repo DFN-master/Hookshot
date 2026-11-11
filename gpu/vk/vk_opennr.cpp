@@ -28,10 +28,11 @@
 #include "shaders/opennr_khr_spv.h"
 #include "shaders/opennr_post_comp_spv.h"
 #include "shaders/opennr_pre_comp_spv.h"
-#include "vk_camera_motion.h"
-#include "vk_draw.h"
+#include "vk_fsr3_inputs.h"   // (the scene's motion, for the temporal path)
 #include "vk_menu.h"
 #include "vk_paths.h"
+#include "vk_texture.h"   // (texture_frame_no)
+#include "vk_work.h"      // (after the others: the commands here go through the recorder, vk_recorder.h)
 
 namespace mkwvk::opennr {
 namespace {
@@ -90,8 +91,7 @@ struct State {
     uint32_t parity{};
     bool history_valid{};
     uint64_t frame{};
-    float last_view_projection[16]{};
-    bool have_view_projection{};
+    std::atomic<uint64_t> motion_frame{};   // (texture_frame_no() when the temporal path last ran: scene_motion_wanted)
     // the GPU time of the whole pass, read back kTimingRing frames later (never waited for)
     VkQueryPool queries{};
     uint64_t timed{};
@@ -614,6 +614,13 @@ bool asked() {
     return nr_settings().on;
 }
 
+bool scene_motion_wanted() {
+    // (the temporal path ran at one of the last few presents: the frame number is the replay's, and a backend switched
+    // off, or to another, stops asking by itself)
+    const uint64_t at = state().motion_frame.load(std::memory_order_relaxed);
+    return at && texture_frame_no() - at <= 3;
+}
+
 const char* why() {
     if (!selected())
         return "No model at the start: supply yours in nr-model (readme), then restart the game.";
@@ -683,32 +690,33 @@ VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, VkImag
         return VK_NULL_HANDLE;
     }
 
-    // ---- the motion, for the temporal path: the scene's camera-only motion (vk_camera_motion.h), when there is a
-    // scene. A camera that did not move gets no pass at all (zero motion: the history at the same pixel), because the
-    // motion module answers a repeated matrix with the target it last wrote, which here would be a moving frame's.
+    // ---- the motion, for the temporal path: the scene's own, as the frame generation methods take it
+    // (vk_fsr3_inputs.h: made at the gameplay upscale's dispatch from the scene's camera and depth, without the jitter, in
+    // render pixels toward the frame before). A present without a scene (a menu, the title, a movie) has none: the
+    // history is then taken at the same pixel. A frame the inputs call a reset (the first, a cut, a new size) has no
+    // history worth blending with.
     static const bool temporal = !getenv("RX_VK_OPENNR_TEMPORAL") || atoi(getenv("RX_VK_OPENNR_TEMPORAL")) != 0;
     VkImageView motion = VK_NULL_HANDLE;
     float motion_size[2] = {1.0f, 1.0f};
+    bool scene_reset = false;
     if (temporal) {
-        SceneFrameInputs scene;
-        if (scene_frame_inputs(&scene) && scene.have_view_projection && scene.depth_view) {
-            const bool moved = !s.have_view_projection ||
-                               memcmp(s.last_view_projection, scene.view_projection, sizeof s.last_view_projection) != 0;
-            memcpy(s.last_view_projection, scene.view_projection, sizeof s.last_view_projection);
-            s.have_view_projection = true;
-            if (moved) {
-                camera_motion::Matrix vp{};
-                memcpy(vp.m, scene.view_projection, sizeof vp.m);
-                motion = camera_motion::record(cmd, scene.depth_view, scene.depth_format, scene.render_width,
-                                               scene.render_height, vp);
-                motion_size[0] = (float)scene.render_width, motion_size[1] = (float)scene.render_height;
+        s.motion_frame.store(texture_frame_no(), std::memory_order_relaxed);   // (scene_motion_wanted: the draws ask)
+        fsr3_inputs::Frame scene;
+        if (fsr3_inputs::latest(scene) && scene.motion && scene.width && scene.height) {
+            scene_reset = scene.reset;
+            if (!scene.reset) {
+                motion = scene.motion;
+                motion_size[0] = (float)scene.width, motion_size[1] = (float)scene.height;
             }
         }
-        if (motion && motion != s.bound_motion) {   // (the motion target is new: its size changed. Rare)
-            std::lock_guard qk(dev.present_mu);
-            device_wait_idle_locked();
-            write_sets(s, motion);
-        }
+    }
+    // (the sets name the motion's view: written again when it is another one, and back to the 1x1 "none" when there is
+    // none, so that a set never names a view that vk_fsr3_inputs.cpp has since retired. Rare: a new render size, a menu
+    // opened or closed)
+    if (motion != s.bound_motion) {
+        std::lock_guard qk(dev.present_mu);
+        device_wait_idle_locked();
+        write_sets(s, motion);
     }
 
     const uint32_t slot = (uint32_t)(s.frame % kTimingRing);
@@ -744,7 +752,7 @@ VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, VkImag
     // (single-frame: one seed, so a still frame stays still; temporal: a new one each frame, as upstream's demo, the
     // history holding the result together)
     push.seed = temporal ? (uint32_t)s.frame : 1234u;
-    push.history_valid = temporal && s.history_valid ? 1u : 0u;
+    push.history_valid = temporal && s.history_valid && !scene_reset ? 1u : 0u;
     push.motion_valid = motion ? 1u : 0u;
     push.auto_mask = want.auto_mask ? 1u : 0u;
     push.style = (float)want.style;
@@ -760,7 +768,9 @@ VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, VkImag
     // (the network is foreign work -- dispatches and CUDA launches -- so whole-pipeline barriers on both sides)
     barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
             VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+    ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (the network records into cmd itself: what this thread recorded through vk_work.h reaches cmd first)
     opennr_net::record(s.net, cmd);
+    note_work();   // (commands vk_work.h did not see: the barrier after them is recorded)
     barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
     // (vkCmdExecuteCommands leaves the primary's bound state undefined: everything again)

@@ -17,7 +17,7 @@ namespace HookshotBuilder;
 /// through Game files > Build > Play. The game's update offer (Updater.cs) opens the same window on its update screen.
 public partial class MainWindow : Window
 {
-    const long NeededBytes = 60L << 30;
+    const long NeededBytes = 45L << 30;   // (measured 2026-11-09: the game data 24.4 GB, the shader caches ~8 GB, the game 0.4 GB, the build files ~5 GB at their peak; the rest headroom)
     Language lang = Strings.Default();
     string T(S s) => (int)s < lang.Text.Length ? lang.Text[(int)s] : Strings.All[0].Text[(int)s];
 
@@ -52,6 +52,11 @@ public partial class MainWindow : Window
         LanguageBox.SelectedItem = lang;
         WorkerBox.ItemsSource = BuildWorkers.Choices(Environment.ProcessorCount);
         WorkerBox.SelectedIndex = 0;
+        MemoryBox.ItemsSource = BuildMemory.Choices(BuildMemory.TotalGb());
+        MemoryBox.SelectedIndex = 0;
+        TrackBox.ItemsSource = TrackNames;
+        TrackBox.SelectedIndex = Array.IndexOf(TrackIds, Track);
+        TrackBox.SelectionChanged += TrackChanged;
         clock.Tick += (_, _) => Tick();
         Drop += Dropped;
         SourceInitialized += (_, _) =>
@@ -113,7 +118,7 @@ public partial class MainWindow : Window
         ShowMain();
         if (Environment.GetEnvironmentVariable("HOOKSHOT_UI_PREVIEW") is { Length: > 0 } preview) { Preview(preview); return; }
         CheckAll();
-        latestTag = Environment.GetEnvironmentVariable("HOOKSHOT_LATEST_TAG") is { Length: > 0 } fake ? (fake == "none" ? null : fake) : await Updater.LatestTag();
+        latestTag = Environment.GetEnvironmentVariable("HOOKSHOT_LATEST_TAG") is { Length: > 0 } fake ? (fake == "none" ? null : fake) : await Updater.LatestTag(Track);
         RefreshMode();
     }
 
@@ -145,10 +150,10 @@ public partial class MainWindow : Window
         var game = OutPath.Text.Length > 2 ? GameVersion(OutPath.Text) : null;
         var builder = Tools.Find()?.Version;
         // (the newest release known: GitHub's, else this builder's own. v2.0.0 took a GitHub that did not answer for "up to date")
-        updateTarget = latestTag ?? builder;
+        updateTarget = Updater.Target(latestTag, builder, Track);
         if (game != null && updateTarget != null && game != updateTarget && !sourcePicked) mode = Mode.UpdateGame;
         else if (game != null && !sourcePicked) mode = Mode.UpToDate;
-        else if (latestTag != null && builder != null && builder != latestTag) mode = Mode.UpdateBuilder;
+        else if (latestTag != null && builder != null && builder != updateTarget) mode = Mode.UpdateBuilder;
         else mode = Mode.Build;
         switch (mode)
         {
@@ -167,7 +172,7 @@ public partial class MainWindow : Window
                 break;
             case Mode.UpdateBuilder:
                 FilesTitle.Text = "Build your game";
-                FilesSub.Text = $"Hookshot Builder {latestTag} is available (this one is {builder}): update it first, then build.";
+                FilesSub.Text = $"Hookshot Builder {updateTarget} is available (this one is {builder}): update it first, then build.";
                 BuildButton.Content = "Update builder";
                 break;
             default:
@@ -199,8 +204,8 @@ public partial class MainWindow : Window
         LaunchVersion.Text = (game != null ? $"Hookshot {game}" : "Hookshot") + " · " + folder;
         LaunchPlay.IsEnabled = File.Exists(GameExe(folder));
         ShowPage(LaunchPage);
-        latestTag = Environment.GetEnvironmentVariable("HOOKSHOT_LATEST_TAG") is { Length: > 0 } fake ? (fake == "none" ? null : fake) : await Updater.LatestTag();
-        updateTarget = latestTag ?? Tools.Find()?.Version;   // (GitHub's newest, else this builder's own)
+        latestTag = Environment.GetEnvironmentVariable("HOOKSHOT_LATEST_TAG") is { Length: > 0 } fake ? (fake == "none" ? null : fake) : await Updater.LatestTag(Track);
+        updateTarget = Updater.Target(latestTag, Tools.Find()?.Version, Track);   // (GitHub's newest, else this builder's own)
         if (updateTarget == null) LaunchStatus.Text = "Could not check for updates (GitHub did not answer)";
         else if (game != null && game != updateTarget && GameVersion(folder) != null)
         {
@@ -241,7 +246,43 @@ public partial class MainWindow : Window
         Process.Start(si);
     }
 
-    void LaunchUpdateClick(object sender, RoutedEventArgs e) => Updater.UpdateFolder(this, launchFolder, updateTarget, fetched: false);
+    void LaunchUpdateClick(object sender, RoutedEventArgs e)
+    {
+        if (OlderOk(GameVersion(launchFolder))) Updater.UpdateFolder(this, launchFolder, updateTarget, fetched: false, named: Switching);
+    }
+
+    // ---- the update track (Updater.cs): the one chosen in the Track menu, saved; by default these tools' own ----
+    static readonly string[] TrackIds = { Updater.Release, Updater.Candidate, Updater.Nightly };
+    static readonly string[] TrackNames = { "Release", "Release candidate", "Nightly" };
+    string? chosenTrack;
+    string Track
+    {
+        get
+        {
+            if (chosenTrack != null) return chosenTrack;
+            var saved = BuilderSettings.Load(SettingsPath)?.Track;
+            return saved != null && TrackIds.Contains(saved) ? saved : Updater.TrackOf(Tools.Find()?.Version);
+        }
+    }
+    /// (a track other than these tools' own: its newest is installed, even an older version)
+    bool Switching => Track != Updater.TrackOf(Tools.Find()?.Version);
+
+    async void TrackChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (TrackBox.SelectedIndex < 0 || TrackIds[TrackBox.SelectedIndex] == Track) return;
+        chosenTrack = TrackIds[TrackBox.SelectedIndex];
+        SaveSettings();
+        latestTag = null;
+        RefreshMode();
+        latestTag = await Updater.LatestTag(Track);
+        RefreshMode();
+    }
+
+    /// (going to an older version, from another track: asked first)
+    bool OlderOk(string? have) =>
+        !Switching || !Updater.Newer(have, updateTarget) ||
+        MessageBox.Show(this, $"{updateTarget} is older than {have}, the version you have now. Install {updateTarget}?", "Hookshot",
+                        MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes;
 
     void LaunchPlayClick(object sender, RoutedEventArgs e)
     {
@@ -252,25 +293,20 @@ public partial class MainWindow : Window
     void LaunchFolderClick(object sender, RoutedEventArgs e) =>
         Process.Start(new ProcessStartInfo(launchFolder) { UseShellExecute = true });
 
-    // ---- what the player chose last time (the install folder, the game files): builder-settings.json beside the versions ----
-    sealed class BuilderSettings
-    {
-        public string? Out { get; set; }
-        public string? Nup { get; set; }
-        public string? Romfs { get; set; }
-        public string? Exefs { get; set; }
-        public bool Dlss { get; set; }   // (NVIDIA DLSS ticked: NVIDIA's license was accepted)
-    }
+    // ---- what the player chose last time (BuilderSettings.cs): builder-settings.json beside the versions ----
     static string SettingsPath => System.IO.Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HookshotBuilder", "builder-settings.json");
 
     void ApplySettings()
     {
-        BuilderSettings? s = null;
-        try { s = System.Text.Json.JsonSerializer.Deserialize<BuilderSettings>(File.ReadAllText(SettingsPath)); } catch (Exception) { }
+        var s = BuilderSettings.Load(SettingsPath);
         if (s == null) return;
+        PrepareTick.IsChecked = !s.PrepareLater;
         if (!string.IsNullOrEmpty(s.Out)) OutPath.Text = s.Out;
         DlssTick.IsChecked = s.Dlss;
+        FsrTick.IsChecked = s.Fsr;
+        fsrLicense = s.FsrLicense;
+        MemoryBox.SelectedItem = BuildMemory.Saved(MemoryBox.ItemsSource.Cast<object>(), s.MemoryGb);
         if (s.Romfs != null && s.Exefs != null && Directory.Exists(s.Romfs) && File.Exists(System.IO.Path.Combine(s.Exefs, "main")))
         {
             romfs = s.Romfs;
@@ -293,7 +329,11 @@ public partial class MainWindow : Window
         try
         {
             var s = new BuilderSettings { Out = OutPath.Text, Nup = romfs == null ? chosenNup : null, Romfs = romfs, Exefs = exefs,
-                                          Dlss = DlssTick.IsChecked == true };
+                                          Dlss = DlssTick.IsChecked == true, Fsr = FsrTick.IsChecked == true,
+                                          FsrLicense = fsrLicense,
+                                          PrepareLater = PrepareTick.IsChecked != true,
+                                          MemoryGb = MemoryBox.SelectedItem is int gb ? gb : null,
+                                          Track = chosenTrack ?? BuilderSettings.Load(SettingsPath)?.Track };
             Directory.CreateDirectory(System.IO.Path.GetDirectoryName(SettingsPath)!);
             File.WriteAllText(SettingsPath, System.Text.Json.JsonSerializer.Serialize(s));
         }
@@ -306,7 +346,7 @@ public partial class MainWindow : Window
         switch (what)
         {
             case "build":
-                MakeRows(update: false);
+                MakeRows(update: false, shaders: true);
                 SetStep(1);
                 ShowPage(BuildPage);
                 rows["read"].Begin(); rows["read"].Done(); rows["read"].Small("Version checked");
@@ -537,14 +577,30 @@ public partial class MainWindow : Window
             var free = new DriveInfo(root).AvailableFreeSpace;
             SpaceBar.Value = Math.Min(1, NeededBytes / (double)Math.Max(1, free));
             SpaceBar.Foreground = (Brush)FindResource(free >= NeededBytes ? "Go" : "Bad");
-            SpaceText.Text = $"Needs 60 GB · {root.TrimEnd('\\')} has {free >> 30} GB free";
+            SpaceText.Text = $"Needs 45 GB · {root.TrimEnd('\\')} has {free >> 30} GB free";
             SpaceText.Foreground = (Brush)FindResource(free >= NeededBytes ? "InkSoft" : "Bad");
         }
         catch (Exception)
         {
-            SpaceText.Text = "Needs 60 GB";
+            SpaceText.Text = "Needs 45 GB";
         }
         RefreshMode();
+    }
+
+    /// The game folder or the build files folder on a hard drive: the build works, but much more slowly than on an SSD. Null
+    /// when both are on an SSD (or their drive cannot be told, as on a network share)
+    string? HardDriveWarning()
+    {
+        foreach (var (what, folder) in new[] { ("game folder", OutPath.Text), ("build files folder", Storage.Work) })
+        {
+            if (Disk.Spinning(folder) != true) continue;
+            string root;
+            try { root = System.IO.Path.GetPathRoot(System.IO.Path.GetFullPath(folder))!.TrimEnd('\\'); }
+            catch (Exception e) when (e is ArgumentException or NotSupportedException or PathTooLongException) { root = folder; }
+            return $"The {what} is on a hard drive ({root}). An SSD builds the game much faster: build there if you can.\n\n" +
+                   "Choose OK to build here anyway, or Cancel to choose another folder.";
+        }
+        return null;
     }
 
     void Dropped(object sender, DragEventArgs e)
@@ -628,7 +684,7 @@ public partial class MainWindow : Window
         WorkReset.Visibility = Storage.WorkChosen ? Visibility.Visible : Visibility.Collapsed;
         WorkNote.Text = Storage.KeepBuildFiles
             ? $"Build files: about {Storage.Gb(Storage.BuildFilesBytes)}, kept in {work} so that updates are quick (HOOKSHOT_KEEP_BUILD_FILES)."
-            : $"Build files: about {Storage.Gb(Storage.BuildFilesBytes)} in {work} while it builds, deleted when the game is ready.";
+            : $"Build files: about {Storage.Gb(Storage.BuildFilesBytes)} in {work} while it builds; when the game is ready about 1 GB stays (the compiled code) so that updates compile only what changed.";
         WorkNote.Foreground = (Brush)FindResource("InkSoft");
         try
         {
@@ -661,18 +717,20 @@ public partial class MainWindow : Window
         switch (mode)
         {
             case Mode.UpdateGame:   // (the kept game files; the newer builder first when this one is older)
+                if (!OlderOk(GameVersion(OutPath.Text))) return;
                 SaveSettings();
-                Updater.UpdateFolder(this, OutPath.Text, updateTarget, fetched: false);
+                Updater.UpdateFolder(this, OutPath.Text, updateTarget, fetched: false, named: Switching);
                 return;
             case Mode.UpToDate:
                 finished = OutPath.Text;
                 Play(sender, e);
                 return;
             case Mode.UpdateBuilder:
+                if (!OlderOk(Tools.Find()?.Version)) return;
                 SaveSettings();
                 BuildButton.IsEnabled = false;
                 BuildButton.Content = "Getting the new builder…";
-                try { await Updater.RunLatestSetup(this, Array.Empty<string>()); }
+                try { await Updater.RunLatestSetup(this, Array.Empty<string>(), updateTarget, Switching); }
                 catch (Exception ex)
                 {
                     MessageBox.Show(this, ex.Message + " You can also download HookshotBuilder.exe from the releases page.", "Hookshot");
@@ -692,7 +750,10 @@ public partial class MainWindow : Window
         else if (chosenNup != null) args.AddRange(new[] { "--nup", chosenNup });
         else return;
         args.AddRange(new[] { "--out", OutPath.Text, "--language", lang.Code });
-        Run(tools, args, dlss: DlssTick.IsChecked == true);
+        if (FsrTick.IsChecked == true) args.Add("--fsr");   // (an --update of the folder keeps it: make_game.py's mark)
+        prepareNow = PrepareTick.IsChecked == true;
+        Run(tools, ShaderStep.Args(args, prepareNow), dlss: DlssTick.IsChecked == true,
+            fsr: FsrTick.IsChecked == true && fsrLicense);
     }
 
     const string DlssLicense =
@@ -712,6 +773,32 @@ public partial class MainWindow : Window
         SaveSettings();   // (kept at once, not only when Build is pressed: ticked and closed, it is still ticked next time)
     }
 
+    const string FsrLicense =
+        "AMD FSR 4 is AMD's, not Hookshot's. With it ticked, the build downloads AMD's FSR runtime for Vulkan (FidelityFX SDK " +
+        "v2.4.0: amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll, signed by AMD) from " +
+        "github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK, each file checked against its SHA-256, under AMD's FSR SDK license:\n\n" +
+        "https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/7539ae8b6568ad29ed78a753404351daf3b5cca7/Kits/FidelityFX/docs/license.md\n\n" +
+        "Its files stay on this PC (in the builder's ffx-sdk folder, and the two DLLs with LICENSE-AMD-FSR-SDK.md in the game " +
+        "folder).\n\n" +
+        "Do you accept AMD's license?";
+
+    /// AMD's license accepted on the FSR 4 tick. A tick saved before the builder asked builds with FSR 4 as it did, its DLLs
+    /// the player's own, and fetches nothing until it is ticked again
+    bool fsrLicense;
+
+    /// The AMD FSR 4 tick: AMD's license first, and the tick stays only when it is accepted (as DLSS's; this builder is
+    /// Windows', where AMD publishes the runtime)
+    void FsrChanged(object sender, RoutedEventArgs e)
+    {
+        if (FsrTick.IsChecked == true)
+        {
+            fsrLicense = MessageBox.Show(this, FsrLicense, "AMD FSR 4", MessageBoxButton.YesNo, MessageBoxImage.Information) ==
+                         MessageBoxResult.Yes;
+            if (!fsrLicense) FsrTick.IsChecked = false;
+        }
+        SaveSettings();
+    }
+
     static readonly (string Id, string Build, string Update)[] Stages =
     {
         ("download", "", "Download the update"),
@@ -719,17 +806,30 @@ public partial class MainWindow : Window
         ("lift", "Translate the game to PC code", "Translate the game to PC code"),
         ("compile", "Compile", "Compile changed files"),
         ("finish", "Put the game together", "Swap in the new game"),
+        (ShaderStep.Id, "Prepare the shaders", "Prepare the shaders"),
     };
-    static readonly Dictionary<string, (double From, double Size)> Weight = new()
+    static readonly Dictionary<string, (double From, double Size)> WithShaders = new()
+    {
+        ["download"] = (0, 0.04), ["read"] = (0.04, 0.04), ["lift"] = (0.08, 0.14), ["compile"] = (0.22, 0.68), ["finish"] = (0.90, 0.02),
+        [ShaderStep.Id] = (0.92, 0.08),   // (hookshot --prepare-shaders: minutes on some GPUs, the first start's wait moved here)
+    };
+    static readonly Dictionary<string, (double From, double Size)> WithoutShaders = new()
     {
         ["download"] = (0, 0.04), ["read"] = (0.04, 0.04), ["lift"] = (0.08, 0.14), ["compile"] = (0.22, 0.74), ["finish"] = (0.96, 0.04),
     };
+    Dictionary<string, (double From, double Size)> Weight = WithoutShaders;
+    // (this build prepares the shaders: the tick for a build, the saved choice for an update. The game's @@stage shaders came, and
+    // make_game's line when it left them to the first start: the row's end says which)
+    bool prepareNow, shadersBegan;
+    string? shadersLater;
+    TimeSpan? builtIn;   // (at @@times: the build without the shaders' minutes, as build_times.json keeps it)
 
-    void MakeRows(bool update)
+    void MakeRows(bool update, bool shaders)
     {
         StageList.Children.Clear();
         rows.Clear();
-        var list = Stages.Where(s => update || s.Id != "download").ToList();
+        Weight = shaders ? WithShaders : WithoutShaders;
+        var list = Stages.Where(s => (update || s.Id != "download") && (shaders || s.Id != ShaderStep.Id)).ToList();
         for (var i = 0; i < list.Count; i++)
         {
             var row = new StepRow(i + 1, update ? list[i].Update : list[i].Build, last: i == list.Count - 1);
@@ -739,11 +839,20 @@ public partial class MainWindow : Window
         if (update) rows["read"].Small("Your game files are kept: the .nup isn't needed");
     }
 
-    /// dlss: NVIDIA DLSS, its license accepted: NVIDIA's SDK fetched into Storage.NgxSdk first (only what is missing), and built in
-    void Run(Tools tools, List<string> args, bool keepRows = false, bool dlss = false)
+    /// dlss: NVIDIA DLSS, its license accepted: NVIDIA's SDK fetched into Storage.NgxSdk first (only what is missing), and built in.
+    /// fsr: AMD FSR 4, its license accepted: built with it, AMD's runtime fetched into Storage.FfxSdk and put in the game folder
+    void Run(Tools tools, List<string> args, bool keepRows = false, bool dlss = false, bool fsr = false)
     {
-        int? workers;
-        try { workers = BuildWorkers.Selected(WorkerBox.SelectedItem); }
+        // (a warning, not a stop: the player may have no other folder with the room. An update keeps its rows and its own flow)
+        if (!keepRows && HardDriveWarning() is { } slow &&
+            MessageBox.Show(this, slow, "Hookshot", MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK)
+            return;
+        int? workers, memoryGb;
+        try
+        {
+            workers = BuildWorkers.Selected(WorkerBox.SelectedItem);
+            memoryGb = BuildMemory.Selected(MemoryBox.SelectedItem);
+        }
         catch (ArgumentException e)
         {
             MessageBox.Show(this, e.Message, "Hookshot");
@@ -752,7 +861,7 @@ public partial class MainWindow : Window
         if (!keepRows)
         {
             updating = false;
-            MakeRows(update: false);
+            MakeRows(update: false, shaders: prepareNow);
             SetStep(1);
             BuildTitle.Text = "Building your game";
             UpdateBar.Visibility = Visibility.Collapsed;
@@ -769,6 +878,9 @@ public partial class MainWindow : Window
         compileEta = -1;
         thisCompile = 0;
         previousTotal = -1;
+        shadersBegan = false;
+        shadersLater = null;
+        builtIn = null;
         ShowPage(BuildPage);
         CancelButton.Visibility = Visibility.Visible;
         SetProgress(updating ? Weight["read"].From : 0);
@@ -778,7 +890,9 @@ public partial class MainWindow : Window
         Tick();
         if (Storage.WorkChosen && !args.Contains("--work")) args.AddRange(new[] { "--work", Storage.Work });   // (the build files where the player chose)
         if (dlss && !args.Contains("--fetch-ngx-sdk")) args.AddRange(new[] { "--fetch-ngx-sdk", "--accept-nvidia-license" });
-        runner = new Runner(tools, args, workers, dlss ? Storage.NgxSdk : null);
+        if (fsr && !args.Contains("--fsr")) args.Add("--fsr");
+        if (fsr && !args.Contains("--fetch-fsr-runtime")) args.AddRange(new[] { "--fetch-fsr-runtime", "--accept-amd-license" });
+        runner = new Runner(tools, args, workers, dlss ? Storage.NgxSdk : null, memoryGb, fsr ? Storage.FfxSdk : null);
         runner.Line += l => Dispatcher.BeginInvoke(() => Line(l));
         runner.Finished += failure => Dispatcher.BeginInvoke(() => Ended(failure));
         runner.Start();
@@ -795,6 +909,7 @@ public partial class MainWindow : Window
             current = id;
             if (rows.TryGetValue(id, out var row)) row.Begin();
             if (id == "compile") compileClock.Restart();
+            if (id == ShaderStep.Id) shadersBegan = true;
             if (Weight.TryGetValue(id, out var w)) SetProgress(w.From);
         }
         else if (line.StartsWith("@@progress "))
@@ -813,6 +928,7 @@ public partial class MainWindow : Window
             return;
         }
         else if (line.StartsWith("@@done ")) finished = line[7..];
+        else if (ShaderStep.Reason(line) is { } later) shadersLater = later;
         else if (FilesLine.Match(line) is { Success: true } m) filesOf = int.Parse(m.Groups[1].Value);
         else if (FileLine.IsMatch(line)) filesDone++;
         if (current == "compile" && filesChanged < 0 && filesOf > 0 && rows.TryGetValue("compile", out var c))
@@ -843,6 +959,7 @@ public partial class MainWindow : Window
                 compileEta = eta;
                 break;
             case "@@times" when p.Length == 4:
+                builtIn = elapsed.Elapsed;
                 long.TryParse(p[2], out thisCompile);
                 long.TryParse(p[3], out previousTotal);
                 break;
@@ -916,7 +1033,12 @@ public partial class MainWindow : Window
         runner = null;
         if (finished.Length > 0)
         {
-            foreach (var r in rows.Values) r.Done();
+            foreach (var (id, r) in rows)
+            {
+                if (id != ShaderStep.Id) r.Done();
+                else if (ShaderStep.Skipped(shadersBegan, shadersLater) is { } why) { r.Skipped(); r.Small(why); }
+                else r.Done();
+            }
             SetProgress(1);
             ShowReady();
             return;
@@ -957,7 +1079,7 @@ public partial class MainWindow : Window
         SetStep(2);
         ReadyTitle.Text = updating ? "Your game is updated" : "Your game is ready";
         var compiledNote = thisCompile > 0 ? $" (compiled in {Span(TimeSpan.FromSeconds(thisCompile))})" : "";
-        ReadyNote.Text = $"{(updating ? "Updated" : "Built")} in {Span(elapsed.Elapsed)}{compiledNote}{Against(elapsed.Elapsed)} · {finished}";
+        ReadyNote.Text = $"{(updating ? "Updated" : "Built")} in {Span(elapsed.Elapsed)}{compiledNote}{Against(builtIn ?? elapsed.Elapsed)} · {finished}";
         if (!updating && Environment.GetEnvironmentVariable("HOOKSHOT_UI_PREVIEW") == null)
             Finder.Shortcuts(finished, DesktopTick.IsChecked == true, StartTick.IsChecked == true);
         else if (updating && Environment.GetEnvironmentVariable("HOOKSHOT_UI_PREVIEW") == null)
@@ -989,14 +1111,14 @@ public partial class MainWindow : Window
         StorageRow.Visibility = Visibility.Visible;
     }
 
-    // (players asked for the space back: the build files (translated code, compiled objects), the setup's and updater's downloads and
-    // older builder versions go as soon as the game is ready. The next update then translates and compiles again (about as long as
-    // this build). HOOKSHOT_KEEP_BUILD_FILES=1 keeps them for quick updates, with the Free up space button as before)
+    // (players asked for the space back: the translated code, the setup's and updater's downloads and older builder versions go as soon
+    // as the game is ready. The compiled objects stay (~1 GB): without them every update compiled all ~600 files again, an hour and
+    // more (issue 1287). Free up space lets them go too. HOOKSHOT_KEEP_BUILD_FILES=1 keeps everything)
     async Task FreeAfterBuild()
     {
         if (!Storage.KeepBuildFiles)
         {
-            var left = await Task.Run(Storage.Free);
+            var left = await Task.Run(() => Storage.Free(afterBuild: true));
             if (left >= 100L << 20) AddLog($"build files: {Storage.Gb(left)} could not be deleted (a file in use); they go after the next build");
         }
         await ShowStorageUse();
@@ -1006,7 +1128,7 @@ public partial class MainWindow : Window
     {
         FreeButton.IsEnabled = false;
         FreeButton.Content = "Freeing…";
-        var left = await Task.Run(Storage.Free);
+        var left = await Task.Run(() => Storage.Free());
         await ShowStorageUse();
         if (left >= 100L << 20)
             StorageNote.Text += $" ({Storage.Gb(left)} could not be deleted: a file is in use. Close the game and the builder, and delete the folder's contents by hand.)";
@@ -1132,7 +1254,10 @@ public partial class MainWindow : Window
         StepPill.Visibility = Visibility.Collapsed;
         VersionChip.Visibility = Visibility.Visible;
         VersionChipText.Text = from != null && from != to ? $"{from} → {to}" : to;
-        MakeRows(update: true);
+        prepareNow = BuilderSettings.PrepareNow(SettingsPath);
+        // (the updates show no menu: the saved choice, as ApplySettings may not have run)
+        MemoryBox.SelectedItem = BuildMemory.Saved(MemoryBox.ItemsSource.Cast<object>(), BuilderSettings.Load(SettingsPath)?.MemoryGb);
+        MakeRows(update: true, shaders: prepareNow);
         BuildTitle.Text = "Updating your game";
         BuildNote.Text = "Getting the update…";
         RingBox.Visibility = Visibility.Collapsed;
@@ -1170,10 +1295,21 @@ public partial class MainWindow : Window
     {
         download = null;
         if (rows.TryGetValue("download", out var d)) { d.Done(); d.Small("Build tools checked"); }
-        // (a folder built with NVIDIA DLSS, its license accepted then, is built with it again)
-        var dlss = File.Exists(System.IO.Path.Combine(folder, "ngx", "nvngx_dlss.dll")) &&
-                   File.Exists(System.IO.Path.Combine(Storage.NgxSdk, "LICENSE.txt"));
-        Run(tools, new List<string> { "--update", folder }, keepRows: true, dlss: dlss);
+        // (the saved tick also opts an existing game into DLSS. After a self-update ApplySettings has not run yet;
+        // a folder already built with DLSS keeps it, its license accepted then)
+        var dlss = BuilderSettings.Load(SettingsPath)?.Dlss == true ||
+                   (File.Exists(System.IO.Path.Combine(folder, "ngx", "nvngx_dlss.dll")) &&
+                    File.Exists(System.IO.Path.Combine(Storage.NgxSdk, "LICENSE.txt")));
+        // (AMD FSR 4, the same: the saved tick with AMD's license accepted, or a folder built with FSR 4 whose AMD runtime
+        // was fetched, AMD's license saved beside it then, keeps it and its runtime)
+        var saved = BuilderSettings.Load(SettingsPath);
+        var fsr = (saved?.Fsr == true && saved.FsrLicense) ||
+                  (File.Exists(System.IO.Path.Combine(folder, ".hookshot_fsr")) &&
+                   File.Exists(System.IO.Path.Combine(folder, "amd_fidelityfx_upscaler_vk.dll")) &&
+                   File.Exists(System.IO.Path.Combine(folder, "LICENSE-AMD-FSR-SDK.md")));
+        // (prepareNow: the saved choice, read in BeginUpdate. The launcher's Update and the --update start after a self-update never
+        // ran ApplySettings, so the tick there is only its default)
+        Run(tools, ShaderStep.Args(new List<string> { "--update", folder }, prepareNow), keepRows: true, dlss: dlss, fsr: fsr);
     }
 
     // ================= the window =================
@@ -1285,6 +1421,24 @@ sealed class StepRow
         tick.Visibility = Visibility.Visible;
         name.Foreground = B("Ink");
         name.FontWeight = FontWeights.SemiBold;
+        time.Foreground = B("InkFaint");
+    }
+
+    /// (not done: left to later, the shaders' step when they were not prepared now)
+    public void Skipped()
+    {
+        if (running) Tick();
+        running = false;
+        watch.Stop();
+        disc.Fill = Brushes.Transparent;
+        disc.Stroke = B("GlassLineStrong");
+        disc.StrokeThickness = 1.5;
+        halo.Fill = Brushes.Transparent;
+        number.Text = "–";
+        number.Foreground = B("InkFaint");
+        tick.Visibility = Visibility.Collapsed;
+        name.Foreground = B("InkFaint");
+        name.FontWeight = FontWeights.Medium;
         time.Foreground = B("InkFaint");
     }
 

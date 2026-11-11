@@ -601,6 +601,11 @@ namespace mkwvk::nr {
 // (the open backend, OpenDLSS-NR, is in every build: so is the Neural tab)
 bool built() { return true; }
 
+bool wanted() {
+    if (const char* e = getenv("RX_VK_DLSS_NR")) return atoi(e) != 0;
+    return nr_settings().on;
+}
+
 int asked_backend() {
     // Live, every call, like the switch: the row changes the next frame.
     if (const char* e = getenv("RX_VK_DLSS_NR_BACKEND"); e && *e) {

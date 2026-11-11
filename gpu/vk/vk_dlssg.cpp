@@ -1,8 +1,8 @@
 // (hookshot) DLSS Frame Generation: gpu/vk/vk_dlssg.h says what it is for and where it slots in.
 #include "vk_dlssg.h"
-#include "vk_menu.h"   // (the Insert menu's "Made frames by" row)
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cfloat>
 #include <cstring>
@@ -15,6 +15,7 @@
 #include <nvsdk_ngx_defs_dlssg.h>
 #include <nvsdk_ngx_params_dlssg.h>
 #endif
+#include "vk_work.h"   // (after the others: the commands here go through the recorder, vk_recorder.h; NGX's own, vk_ngx.cpp)
 
 namespace mkwvk::dlssg {
 namespace {
@@ -29,26 +30,15 @@ constexpr bool kHaveSdk = false;
 
 constexpr uint32_t kMaxMade = 3;   ///< (DLSS 4's multi-frame generation: up to three made frames)
 
-/// `RX_VK_DLSSG=<1-3>` asks for this backend and says how many frames to make between two of the
-/// game's. Off is the default and costs nothing.
-uint32_t asked() {
-    // (hookshot) The switch cannot change while the process runs; the menu row can. Read once and
-    // every time respectively, so the setting takes effect while playing. (DLSS frame generation
-    // still needs its device extensions, which are chosen before the device exists -- so turning it
-    // on mid-game reaches a device that may not carry them, and vk_framegen.cpp falls back.)
+/// RX_VK_DLSSG: 0 never (and none of its device extensions asked for), 1 to 3 the most frames it makes between two of the
+/// game's, under what NGX allows here; unset: whatever NGX allows. Which sets it makes is the Frame generation and Frame
+/// generation method rows' to say (vk_framegen.cpp, framegen_methods.h), read every frame there
+int env_limit() {
     static const int env = []() {
         const char* e = getenv("RX_VK_DLSSG");
-        return e && *e ? std::max(0, atoi(e)) : -1;
+        return e && *e ? std::clamp(atoi(e), 0, (int)kMaxMade) : -1;
     }();
-    if (env >= 0) return (uint32_t)std::min(env, (int)kMaxMade);
-    {
-        // Otherwise the Insert menu: "Made frames by" picks DLSS, and "Frame generation" says how
-        // many frames there are to make -- one fewer than the multiplier, since the last of each
-        // set is the game's own frame.
-        // The native "Frame generation" row: how many frames, not which library (vk_fsr3fi.cpp).
-        const int made = std::clamp(opts.framegen - 1, 0, (int)kMaxMade);
-        return (uint32_t)made;
-    }
+    return env;
 }
 
 struct Image {
@@ -68,6 +58,14 @@ struct State {
     bool first_evaluation = true;
 };
 State g;
+std::atomic<uint32_t> multi_max{1};   ///< NGX's DLSSG.MultiFrameCountMax here (capable)
+
+/// The device idle, for freeing what a frame in flight may still use: the old size's images and feature. As
+/// vk_framegen.cpp's ensure_size does at the same moment (every queue idle, the present queue's too)
+void idle() {
+    std::lock_guard qk(dev.present_mu);
+    device_wait_idle_locked();
+}
 
 constexpr VkImageSubresourceRange ONE_LEVEL{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
@@ -146,7 +144,16 @@ bool ngx_available() {
                                 "Frame Generation"))
         return false;
     if (!params) params = ngx::allocate_params();
-    return params != nullptr;
+    if (!params) return false;
+    // (how many frames it makes between two of the game's on this GPU: "If 1 or not set, multiframe is not supported")
+    NVSDK_NGX_Parameter* caps = nullptr;
+    if (NVSDK_NGX_SUCCEED(NVSDK_NGX_VULKAN_GetCapabilityParameters(&caps)) && caps) {
+        unsigned most = 0;
+        if (NVSDK_NGX_SUCCEED(ngx::get(caps, NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &most)) && most > 1)
+            multi_max.store(std::min(most, kMaxMade), std::memory_order_relaxed);
+        NVSDK_NGX_VULKAN_DestroyParameters(caps);
+    }
+    return true;
 }
 
 /// The feature, made at the first evaluation after a change of extents. Creation records into a
@@ -171,8 +178,8 @@ bool ngx_feature(VkCommandBuffer cmd) {
         feature = nullptr;
         return false;
     }
-    logf("vk: dlssg: feature ready, %ux%u from %ux%u, up to %u made frames", g.width, g.height,
-         g.render_width, g.render_height, asked());
+    logf("vk: dlssg: feature ready, %ux%u from %ux%u, %u made frame(s) a frame", g.width, g.height,
+         g.render_width, g.render_height, g.ready);
     return true;
 }
 
@@ -202,33 +209,32 @@ bool ngx_generate(VkCommandBuffer cmd, const Inputs& in, Image& out) {
 
     ngx::set(params, NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, in.frames_made);
     ngx::set(params, NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, in.frame_index);
-    // The matrices are the whole of what places a made frame in time. They are passed as the SDK
-    // takes them -- a pointer to sixteen floats -- in the row-major order the rest of this renderer
-    // uses; the camera-motion pass uses the same pair and its picture agreed with the game's, which
-    // is the only check available without NVIDIA's own tooling.
-    if (in.have_matrices) {
-        ngx::set(params, NVSDK_NGX_DLSSG_Parameter_ClipToPrevClip, (void*)in.clip_to_prev_clip);
-        ngx::set(params, NVSDK_NGX_DLSSG_Parameter_PrevClipToClip, (void*)in.prev_clip_to_clip);
-        ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraViewToClip, (void*)in.camera_view_to_clip);
-        ngx::set(params, NVSDK_NGX_DLSSG_Parameter_ClipToCameraView, (void*)in.clip_to_camera_view);
-        ngx::set(params, NVSDK_NGX_DLSSG_Parameter_ClipToLensClip, (void*)in.clip_to_lens_clip);
-        ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraPosX, in.camera_pos[0]);
-        ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraPosY, in.camera_pos[1]);
-        ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraPosZ, in.camera_pos[2]);
-        ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraUpX, in.camera_up[0]);
-        ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraUpY, in.camera_up[1]);
-        ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraUpZ, in.camera_up[2]);
-        ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraRightX, in.camera_right[0]);
-        ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraRightY, in.camera_right[1]);
-        ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraRightZ, in.camera_right[2]);
-        ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraFwdX, in.camera_forward[0]);
-        ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraFwdY, in.camera_forward[1]);
-        ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraFwdZ, in.camera_forward[2]);
-        ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraPinholeOffsetX, 0.0f);
-        ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraPinholeOffsetY, 0.0f);
-    }
+    // The camera is the whole of what places a made frame in time, and it is dlssg_math.h's: NGX takes row vectors and
+    // the depth image's own clip space, neither of which is how the renderer keeps the scene's matrices. Each is a pointer
+    // to sixteen floats that must outlive the call, which `in` does.
+    const dlssg_math::Camera& c = in.camera;
+    ngx::set(params, NVSDK_NGX_DLSSG_Parameter_ClipToPrevClip, (void*)c.clip_to_prev_clip);
+    ngx::set(params, NVSDK_NGX_DLSSG_Parameter_PrevClipToClip, (void*)c.prev_clip_to_clip);
+    ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraViewToClip, (void*)c.view_to_clip);
+    ngx::set(params, NVSDK_NGX_DLSSG_Parameter_ClipToCameraView, (void*)c.clip_to_view);
+    ngx::set(params, NVSDK_NGX_DLSSG_Parameter_ClipToLensClip, (void*)c.clip_to_lens_clip);
+    ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraPosX, c.position[0]);
+    ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraPosY, c.position[1]);
+    ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraPosZ, c.position[2]);
+    ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraUpX, c.up[0]);
+    ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraUpY, c.up[1]);
+    ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraUpZ, c.up[2]);
+    ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraRightX, c.right[0]);
+    ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraRightY, c.right[1]);
+    ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraRightZ, c.right[2]);
+    ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraFwdX, c.forward[0]);
+    ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraFwdY, c.forward[1]);
+    ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraFwdZ, c.forward[2]);
+    ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraPinholeOffsetX, 0.0f);
+    ngx::set(params, NVSDK_NGX_DLSSG_Parameter_CameraPinholeOffsetY, 0.0f);
     ngx::set(params, NVSDK_NGX_DLSSG_Parameter_OrthoProjection, 0u);
     ngx::set(params, NVSDK_NGX_DLSSG_Parameter_MvecDilated, 0u);
+    ngx::set(params, NVSDK_NGX_DLSSG_Parameter_MvecJittered, 0u);   // (vk_fsr3_inputs.cpp takes the jitter off them)
     ngx::set(params, NVSDK_NGX_DLSSG_Parameter_MvecInvalidValue, -FLT_MAX);
     ngx::set(params, NVSDK_NGX_DLSSG_Parameter_MinRelativeLinearDepthObjectSeparation, 40.0f);
     ngx::set(params, NVSDK_NGX_DLSSG_Parameter_JitterOffsetX, in.jitter[0]);
@@ -284,7 +290,8 @@ void ngx_shutdown() {}
 
 } // namespace
 
-/// What this build and device can do, which cannot change while they run.
+/// What this build and device can do, which cannot change while they run. (A function's static: asked once, whichever
+/// thread asks first, the others waiting for the answer.)
 bool capable() {
     static const bool yes = []() {
         if (!kHaveSdk) {
@@ -293,20 +300,27 @@ bool capable() {
             return false;
         }
         if (!ngx_available()) return false;
-        logf("vk: dlssg: frame generation is available on this device");
+        logf("vk: dlssg: frame generation is available on this device, up to %u made frame(s) between two of the game's",
+             multi_max.load(std::memory_order_relaxed));
         return true;
     }();
     return yes;
 }
 
 bool supported() {
-    // Not cached, so the menu row takes effect on the next frame: see asked().
-    return asked() != 0 && capable();
+    return env_limit() != 0 && dev.device && capable();
+}
+
+uint32_t max_frames() {
+    if (!supported()) return 0;
+    const uint32_t most = multi_max.load(std::memory_order_relaxed);
+    return env_limit() > 0 ? std::min(most, (uint32_t)env_limit()) : most;
 }
 
 size_t device_extensions(VkInstance instance, VkPhysicalDevice gpu, const char** out, size_t max) {
 #if defined(HOOKSHOT_NGX)
-    if (!asked()) return 0;   // (RX_VK_DLSSG: a run that did not ask gets the device it had)
+    if (env_limit() == 0) return 0;
+    if (const char* e = getenv("RX_VK_DLSS"); e && *e && atoi(e) == 0) return 0;   // (NGX off for this run: vk_dlss.cpp)
     return ngx::device_extensions(instance, gpu, NVSDK_NGX_Feature_FrameGeneration, out, max);
 #else
     (void)instance, (void)gpu, (void)out, (void)max;
@@ -314,20 +328,19 @@ size_t device_extensions(VkInstance instance, VkPhysicalDevice gpu, const char**
 #endif
 }
 
-uint32_t frames_wanted() {
-    return supported() ? asked() : 0;
-}
+namespace {
 
-bool prepare(uint32_t width, uint32_t height, uint32_t render_width, uint32_t render_height,
-             VkFormat present_format) {
-    if (!supported()) return false;
-    if (!width || !height || !render_width || !render_height) return false;
+/// The images the made frames resolve into, and the feature's sizes: made again when the sizes, the presented format or
+/// the count change. Frames in flight use the old ones, so the device goes idle first (rare: a resize, another multiplier).
+bool prepare(uint32_t width, uint32_t height, uint32_t render_width, uint32_t render_height, VkFormat present_format,
+             uint32_t n) {
+    if (!width || !height || !render_width || !render_height || !n || n > kMaxMade) return false;
     if (present_format == VK_FORMAT_UNDEFINED) return false;
-    const uint32_t n = asked();
     if (g.ready == n && g.width == width && g.height == height && g.render_width == render_width &&
         g.render_height == render_height && g.present_format == present_format)
         return true;
     // Extents or format changed: the feature was made for the old ones.
+    if (g.ready) idle();
     ngx_drop_feature();
     g.width = width, g.height = height;
     g.render_width = render_width, g.render_height = render_height;
@@ -347,6 +360,8 @@ bool prepare(uint32_t width, uint32_t height, uint32_t render_width, uint32_t re
     return true;
 }
 
+}  // namespace
+
 bool generate(VkCommandBuffer cmd, const Inputs& in) {
     if (!supported()) return false;
     if (!in.color || !in.depth || !in.motion) return false;
@@ -355,10 +370,10 @@ bool generate(VkCommandBuffer cmd, const Inputs& in) {
         in.motion_format == VK_FORMAT_UNDEFINED)
         return false;
     if (!in.width || !in.height || !in.render_width || !in.render_height) return false;
-    if (!in.frame_index || in.frame_index > asked()) return false;
+    if (!in.have_camera) return false;
+    if (!in.frames_made || in.frames_made > max_frames() || !in.frame_index || in.frame_index > in.frames_made) return false;
     if (!(in.near_plane > 0.0f) || !(in.fov_y > 0.0f)) return false;   // (Inputs defaults them)
-    if (!prepare(in.width, in.height, in.render_width, in.render_height, in.color_format))
-        return false;
+    if (!prepare(in.width, in.height, in.render_width, in.render_height, in.color_format, in.frames_made)) return false;
     if (!ngx_feature(cmd)) return false;
     Image& out = g.made[in.frame_index - 1];
     if (!out.image) return false;

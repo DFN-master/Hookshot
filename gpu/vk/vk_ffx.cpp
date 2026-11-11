@@ -1,24 +1,10 @@
-// (hookshot) AMD FSR 4 through AMD's runtime: gpu/vk/vk_ffx.h says what and why. Everything that
-// touches AMD's API is inside _WIN32, because the runtime is Windows DLLs; the stubs at the bottom are
-// what a Linux build compiles, so the call sites need no #ifdef.
+// (hookshot fork) AMD FSR 4's frame generation through AMD's runtime: gpu/vk/vk_ffx.h says what and why. Everything that
+// touches AMD's API is inside _WIN32, because the runtime is Windows DLLs; the stubs at the bottom are what a Linux build
+// compiles, so the call sites need no #ifdef.
 
 #include "vk_ffx.h"
 
 #include <cstdlib>
-
-#include "upscaler_rows.h"
-#include "vk_menu.h"
-
-namespace mkwvk {
-bool fsr4_wanted() {
-    static const bool off = [] {
-        const char* e = getenv("RX_VK_FSR");
-        return e && *e && atoi(e) == 0;
-    }();
-    // (the row first: AMD's runtime is not looked for while the row is not on FSR 4)
-    return !off && opts.dlss == upscaler_rows::FSR4 && ffx::upscale_supported();
-}
-} // namespace mkwvk
 
 #if defined(_WIN32)
 
@@ -27,14 +13,17 @@ bool fsr4_wanted() {
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include "../../third_party/ffx-api/api/include/ffx_api.h"
 #include "../../third_party/ffx-api/api/include/ffx_api_types.h"
 #include "../../third_party/ffx-api/api/include/vk/ffx_api_vk.h"
 #include "../../third_party/ffx-api/framegeneration/include/ffx_framegeneration.h"
-#include "../../third_party/ffx-api/upscalers/include/ffx_upscale.h"
 #include "vk_loader.h"
+#include "vk_paths.h"   // (game_module_path: the game folder, where the release puts AMD's files)
+#include "vk_work.h"    // (after the others: the commands here go through the recorder, and AMD's own are told to it)
 
 namespace mkwvk::ffx {
 namespace {
@@ -47,7 +36,6 @@ int env_int(const char* name, int fallback) {
 struct Image {
     VkImage image = VK_NULL_HANDLE;
     VmaAllocation memory = nullptr;
-    VkImageView view = VK_NULL_HANDLE;   // (for the pass that squares the upscaler's picture back: vk_fsr3.cpp)
     uint32_t width = 0, height = 0;
     VkFormat format = VK_FORMAT_UNDEFINED;
 };
@@ -60,16 +48,6 @@ struct State {
     PfnFfxConfigure configure = nullptr;
     PfnFfxQuery query = nullptr;
     PfnFfxDispatch dispatch = nullptr;
-
-    // upscaling
-    int up_supported = -1;
-    std::string up_provider;
-    ffxContext up = nullptr;
-    uint32_t up_rw = 0, up_rh = 0, up_ow = 0, up_oh = 0;
-    Image up_out;
-    bool up_first = true;
-    bool up_infinite = false;   // (the context's FFX_UPSCALE_ENABLE_DEPTH_INFINITE: made again when the camera's differs)
-    bool up_failed = false;
 
     // frame generation
     int fg_supported = -1;
@@ -94,21 +72,27 @@ void message(uint32_t type, const wchar_t* text) {
     logf("vk: amd fsr %s: %s", type == FFX_API_MESSAGE_TYPE_ERROR ? "error" : "warning", b);
 }
 
-/// Where amd_fidelityfx_loader_vk.dll may be: RX_VK_FFX_DIR, then the game's own folder. A player who
-/// drops AMD's DLLs beside the game should not also have to set an environment variable.
-std::wstring find_loader() {
-    std::wstring dirs[2];
-    if (const wchar_t* e = _wgetenv(L"RX_VK_FFX_DIR"); e && *e) dirs[0] = e;
-    wchar_t exe[MAX_PATH];
-    const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+/// Where amd_fidelityfx_loader_vk.dll may be: RX_VK_FFX_DIR, then where vk_fsr4.cpp looks for the same file (RX_VK_FSR_DIR,
+/// the executable's folder, the game folder), so one copy of AMD's files serves the upscaler and frame generation. (Narrow
+/// paths are UTF-8: the executable's manifest, nx2/win_manifest.py)
+std::string find_loader() {
+    std::vector<std::string> dirs;
+    for (const char* name : {"RX_VK_FFX_DIR", "RX_VK_FSR_DIR"})
+        if (const char* e = getenv(name); e && *e) dirs.emplace_back(e);
+    char exe[MAX_PATH];
+    DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
     if (n && n < MAX_PATH) {
-        std::wstring d(exe, n);
-        dirs[1] = d.substr(0, d.find_last_of(L"\\/"));
+        const std::string s(exe, n);
+        dirs.push_back(s.substr(0, s.find_last_of("\\/")));
     }
-    for (const std::wstring& d : dirs) {
-        if (d.empty()) continue;
-        const std::wstring p = d + L"\\amd_fidelityfx_loader_vk.dll";
-        if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return p;
+    n = game_module_path(exe, MAX_PATH);
+    if (n && n < MAX_PATH) {
+        const std::string s(exe, n);
+        dirs.push_back(s.substr(0, s.find_last_of("\\/")));
+    }
+    for (const std::string& d : dirs) {
+        const std::string p = d + "\\amd_fidelityfx_loader_vk.dll";
+        if (GetFileAttributesA(p.c_str()) != INVALID_FILE_ATTRIBUTES) return p;
     }
     return {};
 }
@@ -116,9 +100,9 @@ std::wstring find_loader() {
 // (hookshot) Every call into AMD's DLLs goes through these: a fault inside the runtime (a driver it does not expect, a
 // provider that dereferences what an NVIDIA device does not have) costs FSR 4, not the game. Plain C functions with no
 // objects to unwind, which is what __try needs; noinline so the guard stays around the call.
-__declspec(noinline) HMODULE guarded_load(const wchar_t* path) {
+__declspec(noinline) HMODULE guarded_load(const char* path) {
     __try {
-        return LoadLibraryExW(path, nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        return LoadLibraryExA(path, nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     } __except (1) {
         return nullptr;
     }
@@ -161,14 +145,14 @@ bool load() {
         logf("vk: amd fsr 4: off for this run (RX_VK_FFX=0)");
         return false;
     }
-    const std::wstring path = find_loader();
+    const std::string path = find_loader();
     if (path.empty()) {
         logf("vk: amd fsr 4: no amd_fidelityfx_loader_vk.dll beside the game or in RX_VK_FFX_DIR (readme.md says "
-             "which of AMD's files to put there)");
+             "which of AMD's files to put there): no FSR 4 frame generation");
         return false;
     }
-    // (the loader looks for the upscaler and frame generation DLLs in its own folder)
-    logf("vk: amd fsr 4: loading AMD's runtime");
+    // (the loader looks for the frame generation DLL in its own folder)
+    logf("vk: amd fsr 4: loading AMD's runtime for frame generation (%s)", path.c_str());
     s.module = guarded_load(path.c_str());
     if (!s.module) {
         logf("vk: amd fsr 4: amd_fidelityfx_loader_vk.dll did not load (error %lu)", GetLastError());
@@ -250,7 +234,6 @@ FfxApiResource resource(VkImage image, VkFormat format, uint32_t w, uint32_t h, 
 bool infinite(float near_plane, float far_plane) { return !(far_plane > near_plane) || far_plane >= FLT_MAX; }
 
 void drop(Image& im) {
-    if (im.view) vkDestroyImageView(dev.device, im.view, nullptr);
     if (im.image) destroy_image(im.image, im.memory);
     im = Image{};
 }
@@ -273,14 +256,6 @@ bool make(VkCommandBuffer cmd, Image& im, VkFormat format, uint32_t w, uint32_t 
         return false;
     }
     im.width = w, im.height = h, im.format = format;
-    VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    vc.image = im.image, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = format;
-    vc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    if (vkCreateImageView(dev.device, &vc, nullptr, &im.view) != VK_SUCCESS) {
-        logf("vk: amd fsr 4: a view of a %ux%u image was not made", w, h);
-        drop(im);
-        return false;
-    }
     VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     b.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
     b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
@@ -295,17 +270,13 @@ bool make(VkCommandBuffer cmd, Image& im, VkFormat format, uint32_t w, uint32_t 
     return true;
 }
 
-/// Everything AMD's runtime may still be reading or writing has to be finished before its context or
-/// one of our images goes: they are only ever destroyed on a size change or at shutdown.
-void idle() { vkDeviceWaitIdle(dev.device); }
-
-void drop_upscaler() {
-    State& s = st();
-    if (s.up || s.up_out.image) idle();
-    if (s.up) s.destroy(&s.up, nullptr);
-    s.up = nullptr;
-    drop(s.up_out);
-    s.up_rw = s.up_rh = s.up_ow = s.up_oh = 0;
+/// Everything AMD's runtime may still be reading or writing has to be finished before its context or one of our images
+/// goes: they are only ever destroyed on a size change or at shutdown. Not a bare vkDeviceWaitIdle: every queue has to be
+/// externally synchronized while the device idles, and the display thread presents on its own (vk_framegen.cpp's
+/// ensure_size does the same at the same moment)
+void idle() {
+    std::lock_guard qk(dev.present_mu);
+    device_wait_idle_locked();
 }
 
 void drop_framegen() {
@@ -319,7 +290,7 @@ void drop_framegen() {
 
 /// A barrier around the runtime's own work: everything before it done, everything after it waiting.
 /// The runtime records into our command buffer and does not know what the replay did before it.
-void full_barrier(VkCommandBuffer cmd) {
+void whole_barrier(VkCommandBuffer cmd) {
     VkMemoryBarrier2 m{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     m.srcStageMask = m.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     m.srcAccessMask = m.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
@@ -332,7 +303,6 @@ void full_barrier(VkCommandBuffer cmd) {
 
 bool built() { return true; }
 
-void probe_upscale();
 void probe_frames();
 
 // (hookshot) AMD's runtime is asked once, at the start, from the render thread (probe(), from vk_main.cpp once the device
@@ -341,123 +311,22 @@ void probe_frames();
 // came meant a menu that never opened.
 void probe() {
     State& s = st();
-    if (s.up_supported >= 0 || !dev.device) return;
-    s.up_supported = s.fg_supported = 0;
-    if (!load()) return;
-    logf("vk: amd fsr 4: asking AMD's runtime what it offers on this GPU");
-    probe_upscale();
-    probe_frames();
-    logf("vk: amd fsr 4: AMD's runtime answered: upscaling %s, frame generation %s", s.up_supported ? "yes" : "no",
-         s.fg_supported ? "yes" : "no");
-}
-
-bool upscale_supported() { return st().up_supported > 0; }
-
-void probe_upscale() {
-    State& s = st();
-    if (!providers(FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, s.up_provider)) {
-        logf("vk: amd fsr 4: AMD's runtime has no upscaler for this GPU");
+    if (s.fg_supported >= 0 || !dev.device) return;
+    s.fg_supported = 0;
+    if (env_int("RX_VK_FFX_FG", 1) == 0) {
+        logf("vk: amd fsr 4: frame generation off for this run (RX_VK_FFX_FG=0)");
         return;
     }
-    logf("vk: amd fsr 4: upscaling available (%s)", s.up_provider.c_str());
-    s.up_supported = 1;
+    if (!load()) return;
+    logf("vk: amd fsr 4: asking AMD's runtime for its frame generation on this GPU");
+    probe_frames();
+    logf("vk: amd fsr 4: AMD's runtime answered: frame generation %s", s.fg_supported > 0 ? "yes" : "no");
 }
-
-const char* upscale_provider() { return st().up_provider.c_str(); }
-
-bool upscale(VkCommandBuffer cmd, const UpscaleInputs& in) {
-    State& s = st();
-    if (s.up_failed || !upscale_supported()) return false;
-    if (!in.color || !in.depth || !in.motion || !in.render_width || !in.render_height || !in.upscale_width ||
-        !in.upscale_height || !(in.near_plane > 0.0f) || !(in.fov_y > 0.0f))
-        return false;
-    const bool inf = infinite(in.near_plane, in.far_plane);
-    if (s.up && (in.render_width > s.up_rw || in.render_height > s.up_rh || in.upscale_width != s.up_ow ||
-                 in.upscale_height != s.up_oh || inf != s.up_infinite))
-        drop_upscaler();
-    if (!s.up) {
-        ffxCreateBackendVKDesc backend{};
-        backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
-        backend.deviceContext = device_context();
-        ffxCreateContextDescUpscale c{};
-        c.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-        c.header.pNext = &backend.header;
-        // The colour as FSR 3.1's passes take it (compiled with FFX_FSR3UPSCALER_OPTION_HDR_COLOR_INPUT), the depth
-        // reversed as vk_fsr3_inputs.cpp makes it (1 at the near plane), infinite only when the scene's projection is
-        // (it is not: its far plane is at 1000.5), and no exposure texture, so the runtime works the exposure out
-        // itself. The render size may change under the context as the game's dynamic resolution moves, within the
-        // maximum.
-        c.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_DEPTH_INVERTED |
-                  (inf ? FFX_UPSCALE_ENABLE_DEPTH_INFINITE : 0u) | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE |
-                  FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION;
-        if (env_int("RX_VK_FFX_DEBUG", 0) > 0) c.flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
-        c.maxRenderSize = {in.upscale_width, in.upscale_height};
-        c.maxUpscaleSize = {in.upscale_width, in.upscale_height};
-        c.fpMessage = message;
-        const ffxReturnCode_t r = guarded_create(s.create, &s.up, &c.header);
-        if (r != FFX_API_RETURN_OK || !s.up) {
-            logf("vk: amd fsr 4: the upscaler's context was not made (FSR API result %u): FSR 4 is off", (unsigned)r);
-            s.up = nullptr;
-            s.up_failed = true;
-            return false;
-        }
-        if (!make(cmd, s.up_out, VK_FORMAT_R16G16B16A16_SFLOAT, in.upscale_width, in.upscale_height)) {
-            drop_upscaler();
-            s.up_failed = true;
-            return false;
-        }
-        s.up_rw = in.upscale_width, s.up_rh = in.upscale_height;
-        s.up_ow = in.upscale_width, s.up_oh = in.upscale_height;
-        s.up_first = true;
-        s.up_infinite = inf;
-        ffxQueryGetProviderVersion v{};
-        v.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
-        if (guarded_query(s.query, &s.up, &v.header) == FFX_API_RETURN_OK && v.versionName) s.up_provider = v.versionName;
-        logf("vk: amd fsr 4: %s from up to %ux%u to %ux%u", s.up_provider.c_str(), s.up_rw, s.up_rh, s.up_ow, s.up_oh);
-    }
-    ffxDispatchDescUpscale d{};
-    d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
-    d.commandList = (void*)cmd;
-    d.color = resource(in.color, in.color_format, in.render_width, in.render_height, false);
-    d.depth = resource(in.depth, in.depth_format, in.render_width, in.render_height, false);
-    d.motionVectors = resource(in.motion, in.motion_format, in.render_width, in.render_height, false);
-    d.output = resource(s.up_out.image, s.up_out.format, s.up_ow, s.up_oh, true);
-    // (the jitter and the motion as vk_fsr3.cpp hands them to FSR 3.1's passes: render pixels, x right and y down, and
-    //  the vectors already in render pixels, so the scale is 1)
-    d.jitterOffset = {in.jitter[0], in.jitter[1]};
-    d.motionVectorScale = {in.motion_scale[0], in.motion_scale[1]};
-    d.renderSize = {in.render_width, in.render_height};
-    d.upscaleSize = {s.up_ow, s.up_oh};
-    d.enableSharpening = false;   // (the Sharpness row sharpens the finished picture already)
-    d.sharpness = 0.0f;
-    d.frameTimeDelta = std::clamp(in.frame_time_ms, 0.0f, 1000.0f);
-    d.preExposure = 1.0f;
-    d.reset = in.reset || s.up_first;
-    d.cameraNear = in.near_plane;
-    d.cameraFar = inf ? FLT_MAX : in.far_plane;
-    d.cameraFovAngleVertical = in.fov_y;
-    d.viewSpaceToMetersFactor = 1.0f;
-    d.flags = 0;
-    full_barrier(cmd);
-    const ffxReturnCode_t r = guarded_dispatch(s.dispatch, &s.up, &d.header);
-    full_barrier(cmd);
-    s.up_first = false;
-    if (r != FFX_API_RETURN_OK) {
-        static int told = 0;
-        if (told++ < 4) logf("vk: amd fsr 4: an upscale was refused (FSR API result %u)", (unsigned)r);
-        return false;
-    }
-    return true;
-}
-
-VkImage output_image() { return st().up_out.image; }
-VkImageView output_view() { return st().up_out.view; }
 
 bool frames_supported() { return st().fg_supported > 0; }
 
 void probe_frames() {
     State& s = st();
-    if (env_int("RX_VK_FFX_FG", 1) == 0) return;
     if (!providers(FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION, s.fg_provider)) {
         logf("vk: amd fsr 4: AMD's runtime has no frame generation for this GPU");
         return;
@@ -466,16 +335,16 @@ void probe_frames() {
     s.fg_supported = 1;
 }
 
-uint32_t frames_wanted() {
-    static const uint32_t cap = (uint32_t)std::clamp(env_int("RX_VK_FFX_FG_MAX", 4), 1, 4);
-    return cap;
+uint32_t max_frames() {
+    static const uint32_t cap = (uint32_t)std::clamp(env_int("RX_VK_FFX_FG_MAX", 1), 1, 4);
+    return frames_supported() ? cap : 0;
 }
 
 bool generate(VkCommandBuffer cmd, const FrameInputs& in) {
     State& s = st();
     if (s.fg_failed || !frames_supported()) return false;
     if (!in.color || !in.depth || !in.motion || !in.width || !in.height || !in.render_width || !in.render_height ||
-        in.frames < 1 || in.frames > 4 || !(in.near_plane > 0.0f) || !(in.fov_y > 0.0f))
+        in.frames < 1 || in.frames > max_frames() || !(in.near_plane > 0.0f) || !(in.fov_y > 0.0f))
         return false;
     const bool inf = infinite(in.near_plane, in.far_plane);
     if (s.fg && (in.width != s.fg_w || in.height != s.fg_h || in.render_width > s.fg_rw ||
@@ -562,20 +431,17 @@ bool generate(VkCommandBuffer cmd, const FrameInputs& in) {
     prep.viewSpaceToMetersFactor = 1.0f;
     prep.depth = resource(in.depth, in.depth_format, in.render_width, in.render_height, false);
     prep.motionVectors = resource(in.motion, in.motion_format, in.render_width, in.render_height, false);
-    if (in.have_view) {
-        // (the view is world -> camera, row major: its rows are the camera's axes in the world, and its position is
-        //  minus the transposed rotation times the translation; vk_framegen.cpp's DLSS-G does the same)
-        const float* v = in.view;
-        for (int c = 0; c < 3; c++) {
-            prep.cameraRight[c] = v[0 * 4 + c];
-            prep.cameraUp[c] = v[1 * 4 + c];
-            prep.cameraForward[c] = v[2 * 4 + c];
-            prep.cameraPosition[c] = -(v[0 * 4 + c] * v[0 * 4 + 3] + v[1 * 4 + c] * v[1 * 4 + 3] +
-                                       v[2 * 4 + c] * v[2 * 4 + 3]);
-        }
+    for (int c = 0; c < 3; c++) {   // (the camera in the world, forward the way it looks: dlssg_math.h)
+        prep.cameraRight[c] = in.camera_right[c];
+        prep.cameraUp[c] = in.camera_up[c];
+        prep.cameraForward[c] = in.camera_forward[c];
+        prep.cameraPosition[c] = in.camera_position[c];
     }
-    full_barrier(cmd);
-    if (const ffxReturnCode_t r = guarded_dispatch(s.dispatch, &s.fg, &prep.header); r != FFX_API_RETURN_OK) {
+    whole_barrier(cmd);
+    ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (ffxDispatch records into cmd itself: what this thread recorded through vk_work.h reaches cmd first)
+    const ffxReturnCode_t prepared = guarded_dispatch(s.dispatch, &s.fg, &prep.header);
+    note_work();   // (AMD's dispatches: the barrier after them is recorded)
+    if (const ffxReturnCode_t r = prepared; r != FFX_API_RETURN_OK) {
         static int told = 0;
         if (told++ < 4) logf("vk: amd fsr 4: frame generation's preparation was refused (FSR API result %u)", (unsigned)r);
         return false;
@@ -593,8 +459,10 @@ bool generate(VkCommandBuffer cmd, const FrameInputs& in) {
     d.minMaxLuminance[0] = 0.0f, d.minMaxLuminance[1] = 1.0f;
     d.generationRect = {0, 0, (int32_t)in.width, (int32_t)in.height};
     d.frameID = s.frame_id;
+    ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (ffxDispatch records into cmd itself: what this thread recorded through vk_work.h reaches cmd first)
     const ffxReturnCode_t r = guarded_dispatch(s.dispatch, &s.fg, &d.header);
-    full_barrier(cmd);
+    note_work();   // (AMD's dispatches: the barrier after them is recorded)
+    whole_barrier(cmd);
     if (r != FFX_API_RETURN_OK) {
         static int told = 0;
         if (told++ < 4)
@@ -613,7 +481,6 @@ void reset() { st().fg_reset = true; }
 
 void shutdown() {
     State& s = st();
-    drop_upscaler();
     drop_framegen();
     if (s.module) FreeLibrary(s.module);
     s = State{};
@@ -627,13 +494,8 @@ namespace mkwvk::ffx {
 
 bool built() { return false; }
 void probe() {}
-bool upscale_supported() { return false; }
-const char* upscale_provider() { return ""; }
-bool upscale(VkCommandBuffer, const UpscaleInputs&) { return false; }
-VkImage output_image() { return VK_NULL_HANDLE; }
-VkImageView output_view() { return VK_NULL_HANDLE; }
 bool frames_supported() { return false; }
-uint32_t frames_wanted() { return 0; }
+uint32_t max_frames() { return 0; }
 bool generate(VkCommandBuffer, const FrameInputs&) { return false; }
 VkImage made_image(uint32_t) { return VK_NULL_HANDLE; }
 void reset() {}

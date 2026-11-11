@@ -8,6 +8,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+RUN_ALL_ARGS = ["--cxx", "g++"]
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -26,13 +28,14 @@ def main():
             ('"Frame generation method", &opts.framegen_method', menu, "the row"),
             ("framegen_methods::step(", menu, "set_row stepping through framegen_methods.h"),
             ("fgm::effective(", menu, "the row showing the method in effect"),
-            ("fgm::effective(chosen, available)", fg, "vk_framegen.cpp choosing through framegen_methods.h"),
-            ("fgm::tries(method, which)", fg, "each vendor method behind the choice"),
-            ("fgm::makes_set(which, m)", fg, "each vendor method only for the sets it can make (FSR 3.1: 2x)"),
-            ("tried(fgm::DLSS)", fg, "DLSS frame generation in the chain"),
-            ("tried(fgm::FSR4)", fg, "FSR 4 frame generation in the chain"),
-            ("tried(fgm::FSR3)", fg, "FSR 3.1 frame generation in the chain"),
-            ("fgm::first(", fg, "the scene's inputs made when a vendor method may take them"),
+            ("fgm::effective(chosen, fgm::available(here))", fg, "vk_framegen.cpp choosing through framegen_methods.h"),
+            ("fgm::first(method, here, m)", fg, "the method that makes the set, only one that makes it whole (FSR 3.1: 2x)"),
+            ("dlssg::max_frames()", fg, "DLSS frame generation within what NGX makes here"),
+            ("ffx::max_frames()", fg, "FSR 4 frame generation within its limit"),
+            ("which == fgm::DLSS ? dlssg_frames(", fg, "DLSS frame generation making the set"),
+            ("ffx_frames(cmd, set, cur, uw, uh, m - 1", fg, "FSR 4 frame generation making the set"),
+            ("which == fgm::FSR3", fg, "FSR 3.1 frame generation making the set"),
+            ("scene_inputs_asked.store(which != fgm::BUILTIN", fg, "the scene's inputs made when a vendor method takes them"),
             ("fgm::first(", menu, "the Frame generation row's hint naming the method that makes the frames")):
         if needle not in where:
             raise SystemExit("missing: %s (%s)" % (what, needle))

@@ -12,9 +12,9 @@
 // converts or downloads model data. RX_VK_OPENNR_MODEL=<dir> names it, else `nr-model` in the game folder. Without
 // one the log and the menu say so and every frame goes to the window as it always did.
 //
-// Same place and contract as the Streamline backend: present_image (vk_replay.cpp) calls dlssnr::apply on the
-// finished frame at display size, before the menu is drawn, and dlssnr::apply hands the frame here when this backend
-// is the selected one. Everything is recorded into that frame's command buffer; nothing is allocated per frame.
+// Same place and contract as the other backends: do_present (vk_replay.cpp) calls nr::apply on the finished frame at
+// display size, once for each of the game's frames and before frame generation or the menu, and nr::apply hands the
+// frame here when this backend is the one that runs. Everything is recorded into that frame's command buffer; nothing is allocated per frame.
 #pragma once
 
 #include <cstdint>
@@ -43,6 +43,9 @@ void device_created();
 /// Whether the player has neural rendering on right now (the Neural rendering row, or RX_VK_DLSS_NR), read live.
 [[nodiscard]] bool asked();
 
+/// Whether its temporal path ran at one of the last few presents, and so wants the scene's motion made at the gameplay
+/// upscale's dispatch (vk_fsr3_inputs.h wanted): asked by the draws, on their own threads; one atomic load.
+[[nodiscard]] bool scene_motion_wanted();
 /// Why it is not running, for the Neural rendering row's hint; empty when it runs or was not asked for.
 [[nodiscard]] const char* why();
 
