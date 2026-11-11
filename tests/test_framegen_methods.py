@@ -27,9 +27,9 @@ def main():
     fi = (ROOT / "gpu" / "vk" / "vk_fsr3fi.cpp").read_text(encoding="utf-8")
     for needle, where, what in (
             ('"Frame generation by", &opts.framegen_by, 0, framegen_methods::kMethods - 1', menu, "the row, with AMD's values"),
-            ("return fgm::step(fgm::effective(v, framegen_by_available()), dir, framegen_by_available());", menu,
-             "the row stepping through framegen_methods.h"),
-            ("if (r.value == &opts.framegen_by) v = framegen_by_step(*r.value, dir);", menu, "set_row stepping that way"),
+            ("return fgm::pick(fgm::effective(v, framegen_by_available()), want, dir, framegen_by_available());", menu,
+             "the row choosing through framegen_methods.h"),
+            ("if (r.value == &opts.framegen_by) v = framegen_by_pick(*r.value, v, dir);", menu, "set_row choosing that way"),
             ("return t[fgm::effective(v, framegen_by_available())];", menu, "the row showing the value in effect"),
             ("opts.framegen_by = fgm::from_old(old_method)", menu, "an older file's Frame generation method"),
             ("fgm::effective(env_method >= 0 ? env_method : opts.framegen_by, fgm::available(framegen_here()))", fg,

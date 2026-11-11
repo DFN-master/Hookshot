@@ -12,8 +12,10 @@ of them.
 
 **Upscalers: upstream's temporal chain** (`gpu/vk/vk_temporal.cpp`). One chain makes the scene's colour, depth, motion
 (the camera's and the actors') and jitter, and hands them to an engine: NVIDIA DLSS and DLAA (`vk_dlss.cpp`), AMD FSR 4
-and its native AA through AMD's runtime (`vk_fsr4.cpp`, a build with `HOOKSHOT_FSR=1`). AMD FSR 3.1 is upstream's too
-(`vk_fsr3.cpp`, on `vk_fsr3_inputs.cpp`'s frame). This fork's own FSR 4 upscale through `vk_ffx.cpp`, its
+and its native AA through AMD's runtime (`vk_fsr4.cpp`, a build with `HOOKSHOT_FSR=1`), and AMD FSR 3.1
+(`vk_fsr3.cpp`, an engine of the chain since upstream's #2305, with the characters' motion). `vk_fsr3_inputs.cpp`'s own
+frame is still made for what is not on the chain: FSR 3.1's frame interpolation, AMD FSR 4's frame generation and the
+open neural rendering network's motion. This fork's own FSR 4 upscale through `vk_ffx.cpp`, its
 `fsr4_wanted()` switch, `scene_frame_inputs()`, `vk_camera_motion.cpp` and the `RX_VK_MRT_CENSUS` / `RX_VK_VP_HUNT`
 diagnostics are gone: where an older section below names them, it is history.
 
@@ -53,8 +55,10 @@ Linux with driver 615.71.09, driven through the control bridge, docs/control.md)
 (1536x864 to 2048x1152), DLAA, AMD FSR 3.1 and Off each drew the scene; NVIDIA DLSS Frame Generation made 600 of 600
 sets at 2x and 3x and 598 of 600 at 4x (NGX offers up to 5 made frames on this card), and a captured made frame is a
 single-edged picture with the HUD intact; Built-in let DLSS-G's feature go and made the sets itself; the row's AMD FSR
-3.1 made 600 of 600 midpoints with DLSS as the Upscaler; and the open neural rendering network ran before DLSS Frame
-Generation at 2x and 3x (599 of 600 sets) at its Resolution scale's 50%. Not run: anything Windows-only (AMD FSR 4's
+3.1 made 600 of 600 midpoints with DLSS as the Upscaler, and with FSR 3.1 as the Upscaler once upstream had put it on
+the temporal chain (its #2305), where DLSS Frame Generation made 600 of 600 sets from FSR 3.1's inputs too; and the open
+neural rendering network ran before DLSS Frame Generation at 2x and 3x (599 and 600 of 600 sets) at its Resolution
+scale's 50%. Not run: anything Windows-only (AMD FSR 4's
 upscaler and frame generation, Streamline) and NVIDIA's neural rendering model, which has no Linux runtime; those
 files are compiled for Windows (clang, `--target=x86_64-w64-mingw32`, syntax only) and no more than that here. One
 thing to know from the runs: with V-Sync at Auto, DLSS Frame Generation presents FIFO, and on Wayland a window that

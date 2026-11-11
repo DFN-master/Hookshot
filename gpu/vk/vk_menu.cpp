@@ -754,9 +754,9 @@ MENU_HINTS(hn_pace, 0, "As soon as it is ready.", "At an even interval: less stu
 // (framegen_methods.h; vk_framegen.cpp framegen_here: each backend keeps its own answer, asked at the start)
 namespace fgm = framegen_methods;
 unsigned framegen_by_available() { return fgm::available(framegen_here()); }
-/// The row's next value from v (set_row): upstream's two, and AMD's where they run here
-int framegen_by_step(int v, int dir) {
-    return fgm::step(fgm::effective(v, framegen_by_available()), dir, framegen_by_available());
+/// The row's value when `want` is asked from v (set_row): upstream's two, and AMD's where they run here
+int framegen_by_pick(int v, int want, int dir) {
+    return fgm::pick(fgm::effective(v, framegen_by_available()), want, dir, framegen_by_available());
 }
 const char* tx_framegen_by(int v) {
     static const char* const t[fgm::kMethods] = {"Auto", "Built-in", "AMD FSR 4", "AMD FSR 3.1"};
@@ -1587,8 +1587,9 @@ void save() {
         // start must not take back to the preset's)
         fprintf(f, "memory_budget=%d\n", opts.budget);
         // (2: game_speed below 2 was only ever the old default, see menu_init; 3: the mouse's buttons are bindings, see
-        // host/nn_hid.c binds_load; 4: Descriptor reuse on by default, see menu_init and vk_draw.cpp desc_slotgen_on)
-        fprintf(f, "options_version=4\n");
+        // host/nn_hid.c binds_load; 4: Descriptor reuse on by default, see menu_init and vk_draw.cpp desc_slotgen_on; 5: the
+        // Menu shortcut "Insert, F1 or Esc" by default, see menu_init)
+        fprintf(f, "options_version=5\n");
         fputs(others.c_str(), f);
         if (!can_bind()) fputs(kept.c_str(), f);
         for (int i = 0; i < HOS_KEY_N && can_bind(); i++) {   // (the keys-only controls, HOS_KEY_*, have no pad_ line)
@@ -1615,7 +1616,7 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
     // (the scaling rows: only what can run here; the Render resolution row through the Upscaler's own steps)
     // (the Upscaler by engine; the Render resolution's Native is the engine's full-size form: upscaler_rows.h)
     if (r.value == &opts.dlss) v = ur::step_engine(upscaler(), dir, upscalers_available());
-    if (r.value == &opts.framegen_by) v = framegen_by_step(*r.value, dir);   // (hookshot fork: AMD's values where they run)
+    if (r.value == &opts.framegen_by) v = framegen_by_pick(*r.value, v, dir);   // (hookshot fork: AMD's values where they run)
     if (r.value == &opts.resolution) {
         int up = upscaler(), res = *r.value;
         ur::step_render(upscaler(), *r.value, dir, &up, &res);
@@ -3213,6 +3214,18 @@ void startup_screen(const StartupView* view) {
 }
 
 static bool first_start = false;   // (menu_init: no options file yet. menu_first_start_for_gpu picks the preset for the card)
+/// (hookshot fork) An options file from before two of the fork's rows moved, as menu_init read it: a scene upscaler saved
+/// on the old Upscaling row (3 FSR 3.1, 4 DLSS) goes to the Upscaler, unless the file has that row too, and the filter
+/// back to the plain copy; the Frame generation method row's value goes to upstream's Frame generation by
+/// (framegen_methods.h from_old), unless the file has that one
+static void fork_options_moved(int old_upscaling, bool has_dlss, int old_method, bool has_by) {
+    if (old_upscaling == 3 || old_upscaling == 4) {
+        if (!has_dlss) opts.dlss = old_upscaling == 3 ? ur::FSR3 : ur::DLSS;
+        opts.upscale = 0;
+    }
+    if (old_method >= 0 && !has_by) opts.framegen_by = fgm::from_old(old_method);
+}
+
 void menu_init() {
     static bool done;
     if (done) return;
@@ -3284,12 +3297,7 @@ void menu_init() {
             mic_tell_host();
         }
         if (!has_resolution && old_dynres >= 0) opts.resolution = old_dynres ? 0 : 1;
-        // (a scene upscaler saved on the old Upscaling row: to the Upscaler, and the filter back to the plain copy)
-        if (old_upscaling == 3 || old_upscaling == 4) {
-            if (!has_dlss) opts.dlss = old_upscaling == 3 ? ur::FSR3 : ur::DLSS;
-            opts.upscale = 0;
-        }
-        if (old_method >= 0 && !has_by) opts.framegen_by = fgm::from_old(old_method);
+        fork_options_moved(old_upscaling, has_dlss, old_method, has_by);   // (hookshot fork: two rows that moved)
         if (menu_auto) opts.menu_size = 2;
         opts.rumble = rumble_step(opts.rumble);   // (a hand-edited 60: 50, on the arrows' steps)
         // (Game speed is Real time by default now: Per frame played at half speed at 30 fps, the "slow motion" players
@@ -3298,6 +3306,10 @@ void menu_init() {
         // (Descriptor reuse is on by default from options_version 4: a file from before wrote its 0 whether chosen or not, as
         // the off default it then was; fewer stutters and a better 1% low in the field, the flash checks clean, 2026-11-10)
         if (version < 4) opts.descriptor_reuse = 1;
+        // (Esc opens the menu by default from options_version 5, as a PC game's pause menu: a file from before wrote its
+        // Menu shortcut 0, Insert or F1, whether chosen or not, and moves to Insert, F1 or Esc, where Insert and F1 still
+        // work. F1 only was chosen: kept)
+        if (version < 5 && opts.menu_shortcut == 0) opts.menu_shortcut = 2;
     }
     first_start = !has_options;
     // An opt-in profile for 4 GB cards: keep existing options authoritative, but make a first run usable on
@@ -3763,8 +3775,9 @@ void menu_tick() {
         restart_state.choose_later(now);
         open_now = false, page = 0, tune_mode = false, changed = true;
     };
-    // (Menu shortcut "Insert, F1 or Esc": Esc on a closed menu opens it, the keyboard's alone (the
-    // gamepad's back is Esc only while it is open, above). The press that opened it does not go back a page below. No
+    // (Menu shortcut "Insert, F1 or Esc", the default: Esc on a closed menu opens it, the keyboard's and RX_VK_MENU_SCRIPT's
+    // ESC alone (the gamepad's back is Esc only while it is open, above). The press that opened it does not go back a page
+    // below; with the compact menu key held it opens the compact bar, as Insert and F1 do (tune_mode). No
     // control can be bound to Esc, so nothing in play changes; the window gives the captured mouse back on the close)
     const bool esc_opens = opts.menu_shortcut == 2 && press[5] && !open_now.load();
     if (esc_opens) press[5] = false;

@@ -55,8 +55,8 @@ constexpr int kVramMinimumOnly = 1;
 bool row_fixed(const int*) { return false; }
 int upscaler() { return 0; }
 unsigned upscalers_available() { return 1; }
-// (hookshot fork: the Frame generation by row's stepping, which set_row calls: upstream's two values here)
-int framegen_by_step(int v, int) { return v ? 0 : 1; }
+// (hookshot fork: the Frame generation by row's choice, which set_row calls: upstream's two values here)
+int framegen_by_pick(int, int want, int) { return want & 1; }
 namespace ur {
 int snap(int, int value) { return value; }
 int snap_render(int, int value) { return value; }   // (the slider)

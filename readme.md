@@ -34,7 +34,7 @@ the console's system software is reimplemented, and the Switch 2 graphics are re
 > Some users report the file in releases to be a Trojan - it is not. Feel free to run it through any antivirus software
 
 
-Discord: https://discord.gg/DVQQJphbBf
+Discord: https://discord.gg/rexed
 <br>
 
 > [!IMPORTANT]
@@ -87,6 +87,9 @@ you start the game from its launcher, which also updates it.
 - An internet connection for the download. Nothing else to install: the builder brings its own compiler and tools.
 
 ### On Windows
+
+For a portable install on an external SSD, run the downloaded setup with `--portable`; see
+[Portable Hookshot Builder](docs/windows-portable-builder.md) for folder, move and repair behavior.
 
 1. Open the [latest release](https://github.com/NotRexed/Hookshot/releases/latest) and download `HookshotBuilder.exe`.
 2. Run it. It downloads the rest of Hookshot Builder (about 500 MB), checks it, and opens it.
@@ -251,125 +254,13 @@ use and cause stalls when the card runs out of headroom. To undo it, turn the ro
 
 ## In-game menu
 
-By default, press <kbd>Insert</kbd> or <kbd>F1</kbd> in game. On a controller, press Home or Select and Start together; on
-a DualShock 4 or DualSense, clicking the touchpad does the same as <kbd>F1</kbd>.
-
-#### Upscaling and frame generation: what this fork adds
-
-**The upscalers are upstream's**, all of them: the Graphics tab's **Upscaler** row (the game's own, NVIDIA DLSS and DLAA,
-AMD FSR 3.1, AMD FSR 4 and its Native AA) and **NVIDIA DLSS Frame Generation** on the **Frame generation by** row's Auto
-are the code upstream ships and tests, described further down this page. This fork used to carry its own FSR 4 upscale
-and its own DLSS frame generation; both are gone in favour of upstream's, which were measured in the game on the hardware
-they are for.
-
-What the fork adds on top:
-
-- **AMD's frame generation on the Frame generation by row.** Beside upstream's **Auto** (NVIDIA DLSS Frame Generation
-  where it runs, else the built-in one) and **Built-in**, the row shows **AMD FSR 4** where AMD's runtime is beside the
-  game (Windows: `amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_framegeneration_vk.dll`, from AMD's FSR SDK; another
-  copy can be named with `RX_VK_FFX_DIR`) and **AMD FSR 3.1** on any GPU its frame interpolation runs on. Both are yours to
-  choose and neither is ever Auto's: they are given the finished picture with the HUD in it, and can smear the HUD (upstream
-  measured that with FSR 3.1's and keeps it behind `RX_VK_FSR_FG=1`). FSR 3.1 makes the frame halfway between two of the
-  game's and no other, so it makes 2x sets only; FSR 4 makes one frame a set unless `RX_VK_FFX_FG_MAX=<1-4>` says more. A
-  set a method does not make whole, or a frame it refuses, is the built-in one's: a frame is never left out.
-  `RX_VK_FG_METHOD=auto|builtin|fsr4|fsr3` picks a value for one run.
-- **DLSS 5 neural rendering** (the Neural tab, below).
-- **A release that carries the renderer CI built** (`tools\prebuilt\hookshot_vk.dll`), with DLSS, DLSS 5 neural rendering
-  and FSR 4 compiled in. The Builder installs that one rather than compiling its own: your PC has none of NVIDIA's SDKs,
-  and a renderer compiled there would leave those out. `HOOKSHOT_VK_LOCAL=1` asks for the local compile anyway. The Linux
-  AppImage carries its renderer the same way, with DLSS in it. NVIDIA's runtimes are NVIDIA's to ship and are never in a
-  release: they come from NVIDIA's DLSS SDK (`github.com/NVIDIA/DLSS`, `lib/Windows_x86_64/rel/` or
-  `lib/Linux_x86_64/rel/`) or a game that ships them, and go in the game folder's `ngx` folder (`nvngx_dlss.dll` and, for
-  frame generation, `nvngx_dlssg.dll`; on Linux `libnvidia-ngx-dlss.so.*` and `libnvidia-ngx-dlssg.so.*`).
-
-#### DLSS 5 neural rendering
-
-The **Neural** tab is NVIDIA's DLSS 5 neural rendering: a model that goes over the finished frame and
-rebuilds detail, tone and structure in it. It is not an upscaler and not ray reconstruction -- it
-takes the picture, not the scene -- so it works on this game, and it stacks with whatever the Upscaler
-and Frame generation are set to. It runs once for each of the game's frames, on the part of the frame
-that is shown, before frame generation: the made frames are made from its picture. All of its rows take
-effect on the next frame.
-
-| Row | What it does |
-|---|---|
-| Neural rendering | The switch. Left out while HDR is Native (the model takes an SDR picture; HDR Expanded is made from its result) |
-| Backend | What runs the model: Auto, Streamline, NGX direct or Open (below) |
-| Model | How much work the model does per frame: Performance, Balanced, Quality (its default), DLAA |
-| Style | The look it aims for: Default, Natural, Cinematic |
-| Preset | Which trained network it uses: Default, or presets A to G |
-| Passes | How many times the model goes over each frame, 1 to 10, each pass on the picture of the one before: a stronger effect, at the model's whole cost (and video memory) again for every pass. Passes after the first leave Local tone out. NVIDIA's model only |
-| Resolution scale | The size the model works at, 50% to 100% of the picture's width and height. Below 100% it is given a smaller copy and its detail is added back at full size, so the picture stays as sharp as the game drew it: the cheapest way to more frames with the model on. Any backend |
-| Intensity | How much of the model's result is mixed into the frame |
-| Local tone, Local structure, Global tone | How far the model may move brightness and colour in a small area, how much fine detail it adds, and how far it may move the whole frame's tone |
-| Skin structure, Auto mask | Detail on characters' skin, and letting the model find the characters itself |
-
-These are the settings the RenoDX DLSS add-on offers for the same model (its style, pass count, processing scale,
-intensity, tone, structure, skin structure and character mask), under the names the model's own options have.
-
-**Three ways to the same network** (the **Backend** row, saved as `nr_backend`;
-`RX_VK_DLSS_NR_BACKEND=auto|streamline|ngx|open` over it for one run): **Streamline**, NVIDIA's plugin and the files in the
-table below; **NGX direct**, which asks NVIDIA's NGX for the feature itself, through the same NGX session DLSS uses, and
-needs only `nvngx_dlssnr.dll`; or **Open (OpenDLSS-NR)**, below, which runs the network on Vulkan without NVIDIA's runtime.
-**Auto** takes Streamline where it is attached and accepts the GPU, then NGX direct where it can run, then Open where a model
-folder is in place. The other rows apply to whichever runs.
-
-**Open (OpenDLSS-NR)** is [OpenDLSS-NR](https://github.com/maanHimself/OpenDLSS-NR) (MIT), a Vulkan implementation of the
-DLSS 5 NR network, built into the renderer on Windows and Linux alike: on Linux it is the way to the feature today. It
-needs an NVIDIA RTX 40 or 50 card for now (`VK_NV_cooperative_matrix2` and `VK_EXT_shader_float8`; the log names anything
-missing), and **a model folder you supply**: the network's weights, in OpenDLSS-NR's layout (`manifest.json` and its stage
-files), in a folder called `nr-model` in the game folder (or wherever `RX_VK_OPENNR_MODEL` points). **Hookshot includes no
-weights and no way to get them**; without a folder the Neural tab says so. Put the folder in place before starting the
-game: the GPU is set up for the network at the start. Its log lines start `vk: open NR`;
-[docs/neural-rendering.md](docs/neural-rendering.md) says what was measured (the kernels, against the network's own CPU
-reference, on synthetic weights) and what was not (image quality with real weights).
-
-**NGX direct** looks for `nvngx_dlssnr.dll` where NGX looks for DLSS's own runtime: the folder `RX_VK_DLSS_DIR` names, then
-the **`ngx` folder in the game folder**, then `%LOCALAPPDATA%\Hookshot\ngx`, then the game folder itself. On Linux NGX
-looks in the same places (`$XDG_DATA_HOME/hookshot/ngx` or `~/.local/share/hookshot/ngx` third) for
-`libnvidia-ngx-dlssnr.so`, which **NVIDIA has not shipped yet**: the Linux NGX core knows the feature, but NVIDIA's SDK has Linux libraries only for DLSS, Ray
-Reconstruction and Frame Generation. Until it does, the Neural tab and the log say so, and on Linux the way to the
-feature is the Windows build under Proton. NGX direct's log lines start `vk: DLSS 5 neural rendering (NGX direct)`; when
-NGX refuses it on Windows they name the GPU, the `nvngx_dlssnr.dll` found, whether it is signed, and the override, as the
-Streamline path's do.
-
-**Streamline is Windows x64 only**: it ships as DLLs.
-
-**RTX 50 with NVIDIA's own model; RTX 20, 30 and 40 with a patched one.** NVIDIA's `nvngx_dlssnr.dll` runs on RTX 50
-(Blackwell) only: on an older card NGX refuses it (`0xbad00001`) and the Neural tab says so. Community builds of the same
-file recompile its model for Turing, Ampere and Ada -- [dlssnr-patcher](https://github.com/dev-camo/dlssnr-patcher)
-patches your own copy, and [openNR](https://github.com/clshortfuse/openNR)'s 310.9.16 compatibility build (an FP16 one,
-reported much faster on RTX 30 and 40) is reconstructed from it. Hookshot loads whichever `nvngx_dlssnr.dll` is there.
-Two things to know:
-
-- A patched file has **no NVIDIA signature**, and NVIDIA's NGX loads an unsigned feature only with its signature override
-  on: the DWORD `EnableSignatureOverride` = `1` under `HKEY_LOCAL_MACHINE\SOFTWARE\NVIDIA Corporation\Global\NGXCore`.
-  Hookshot reads it, for the log, and never sets it: that is your choice to make. It applies to every program on the
-  PC, so turn it back off when you are done, and keep patched DLLs away from games with anti-cheat.
-- It costs more on older cards: about 1.5 times an RTX 5070 Ti's GPU time on an RTX 4070 SUPER, by one report.
-
-When Streamline refuses the feature, the log's `vk: DLSS 5 neural rendering is not supported here` line names the GPU, whether
-the `nvngx_dlssnr.dll` there is NVIDIA's or a patched one, and whether the override is set, and the line after it says
-what is missing.
-
-For Streamline, these files go beside the game, or in a `streamline` folder beside it, or wherever
-`RX_VK_STREAMLINE_DIR` points. They are NVIDIA's to ship; Hookshot builds against Streamline's
-MIT-licensed headers only and loads nothing it has not checked NVIDIA's signature on:
-
-| file | what it is |
-|---|---|
-| `sl.interposer.dll` | Streamline's loader |
-| `sl.common.dll`, `sl.pcl.dll` | the interposer needs both, whichever feature loads on top |
-| `sl.dlss_nr.dll` | the neural rendering plugin |
-| `nvngx_dlssnr.dll` | the model -- it must sit in the same folder as `sl.dlss_nr.dll` |
-
-Keep the three `sl.*` files from one Streamline release: mixing versions is not a supported
-combination. Streamline **2.14.1 or newer** -- older releases do not have the feature at all.
-[docs/neural-rendering.md](docs/neural-rendering.md) has the whole picture, including what is
-measured and what is not.
-
-The same keys close it, and so does <kbd>Esc</kbd>. <kbd>F1</kbd> always works; **Controls → Menu shortcut** can leave
-<kbd>Insert</kbd> free for another overlay. The menu has six tabs, Graphics, Audio, Gameplay, Controls, Neural and Debug:
+By default, press <kbd>Insert</kbd>, <kbd>F1</kbd> or <kbd>Esc</kbd> in game. On a controller, press Home or Select and
+Start together; on a DualShock 4 or DualSense, clicking the touchpad does the same as <kbd>F1</kbd>.
+The same keys close it; with every Menu shortcut, <kbd>Esc</kbd> goes back a page or closes the open menu.
+<kbd>F1</kbd> always works. **Controls → Menu shortcut** can leave <kbd>Insert</kbd> free for another overlay (F1 only).
+With Insert or F1, or with F1 only, <kbd>Esc</kbd> does not open the menu: it only lets the mouse go. Options saved by
+an older version on Insert or F1, the default then, move to Insert, F1 or Esc; F1 only stays.
+The menu has six tabs, Graphics, Audio, Gameplay, Controls, Neural and Debug:
 <kbd>Q</kbd> and <kbd>E</kbd> (or <kbd>Tab</kbd> and <kbd>Shift</kbd>+<kbd>Tab</kbd>) switch between them, LB and RB on
 a controller (or the triggers). <kbd>Up</kbd> and <kbd>Down</kbd> choose a row, <kbd>Left</kbd> and <kbd>Right</kbd>
 change it (<kbd>Enter</kbd> changes it too); beside the rows, the help says what the row is and, on a line of its own,
@@ -441,7 +332,7 @@ HDR peak brightness show only while HDR is on.
 | | Layout preset | Nintendo (Def), Xbox / PC, Swap Face, Custom | Nintendo (Def) |
 | | Motion | Opens the Motion page: Motion controls (Off, On; On), Motion sensitivity X (10% to 600%) and Y (10% to 300%; 100%), Invert motion X and Y (Off, On; Off), Motion deadzone (Low, Standard, High; Standard) | |
 | | Controls | Opens the Controls page | |
-| | Menu shortcut | Insert or F1, F1 only | Insert or F1 |
+| | Menu shortcut | Insert or F1; F1 only; Insert, F1 or Esc | Insert, F1 or Esc |
 | Debug | Debug tools | Off, On (the tools below it while on) | Off |
 | | Developer: Descriptor reuse | Off, On (after a restart) | On |
 | | Developer: Sampler cache | Off, On (after a restart) | Off |
@@ -487,10 +378,10 @@ HDR peak brightness show only while HDR is on.
   stretched across the 32:9 output, sharp but wide. For a size the menu does not offer (3440x1440, 2560x1080, ...), set
   `output_res=<width>x<height>` in `hookshot_options.ini`: each side a multiple of 8, at least 640x360, at most 5120x2880's
   pixels, and between 5:4 and 48:9 in shape; anything else uses the game's 2048x1152. The menu then offers it as its own
-  choice. With **Ultrawide** on, a picture wider than 16:9 is kept to 3840x2160's pixels, so above that a wide size is not a
+  choice. With **Ultrawide** on, a picture wider than 16:9 is kept to 5120x2160's pixels, so above that a wide size is not a
   native frame. A custom output wider than 32:9 also sets the camera shape, even when the OS reports a single
   16:9 primary monitor. For three 16:9 monitors, use `5760x1080` or `7680x1440` and a window or logical display
-  that spans all three. The 7680x1440 output uses a smaller 48:9 internal picture to stay within the pixel budget.
+  that spans all three. Both render at full size: 7680x1440 has 5120x2160's pixels, the most a wide picture takes.
   For one run, set `HOS_OUTPUT_RES` to a size, such as `HOS_OUTPUT_RES=3840x2160`.
 - **Window scaling filter** matters only when your window's size differs from the Output resolution: for the sharpest
   picture, set the Output resolution to your screen's, and the row shows "Not needed (window = output)". It and
@@ -622,6 +513,123 @@ buttons), and count while the mouse is captured. The buttons are `a` `b` `x` `y`
 its default.
 
 </details>
+
+
+### What this fork adds
+
+#### Upscaling and frame generation
+
+**The upscalers are upstream's**, all of them: the Graphics tab's **Upscaler** row (the game's own, NVIDIA DLSS and DLAA,
+AMD FSR 3.1, AMD FSR 4 and its Native AA) and **NVIDIA DLSS Frame Generation** on the **Frame generation by** row's Auto
+are the code upstream ships and tests, described further down this page. This fork used to carry its own FSR 4 upscale
+and its own DLSS frame generation; both are gone in favour of upstream's, which were measured in the game on the hardware
+they are for.
+
+What the fork adds on top:
+
+- **AMD's frame generation on the Frame generation by row.** Beside upstream's **Auto** (NVIDIA DLSS Frame Generation
+  where it runs, else the built-in one) and **Built-in**, the row shows **AMD FSR 4** where AMD's runtime is beside the
+  game (Windows: `amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_framegeneration_vk.dll`, from AMD's FSR SDK; another
+  copy can be named with `RX_VK_FFX_DIR`) and **AMD FSR 3.1** on any GPU its frame interpolation runs on. Both are yours to
+  choose and neither is ever Auto's: they are given the finished picture with the HUD in it, and can smear the HUD (upstream
+  measured that with FSR 3.1's and keeps it behind `RX_VK_FSR_FG=1`). FSR 3.1 makes the frame halfway between two of the
+  game's and no other, so it makes 2x sets only; FSR 4 makes one frame a set unless `RX_VK_FFX_FG_MAX=<1-4>` says more. A
+  set a method does not make whole, or a frame it refuses, is the built-in one's: a frame is never left out.
+  `RX_VK_FG_METHOD=auto|builtin|fsr4|fsr3` picks a value for one run.
+- **DLSS 5 neural rendering** (the Neural tab, below).
+- **A release that carries the renderer CI built** (`tools\prebuilt\hookshot_vk.dll`), with DLSS, DLSS 5 neural rendering
+  and FSR 4 compiled in. The Builder installs that one rather than compiling its own: your PC has none of NVIDIA's SDKs,
+  and a renderer compiled there would leave those out. `HOOKSHOT_VK_LOCAL=1` asks for the local compile anyway. The Linux
+  AppImage carries its renderer the same way, with DLSS in it. NVIDIA's runtimes are NVIDIA's to ship and are never in a
+  release: they come from NVIDIA's DLSS SDK (`github.com/NVIDIA/DLSS`, `lib/Windows_x86_64/rel/` or
+  `lib/Linux_x86_64/rel/`) or a game that ships them, and go in the game folder's `ngx` folder (`nvngx_dlss.dll` and, for
+  frame generation, `nvngx_dlssg.dll`; on Linux `libnvidia-ngx-dlss.so.*` and `libnvidia-ngx-dlssg.so.*`).
+
+#### DLSS 5 neural rendering
+
+The **Neural** tab is NVIDIA's DLSS 5 neural rendering: a model that goes over the finished frame and
+rebuilds detail, tone and structure in it. It is not an upscaler and not ray reconstruction -- it
+takes the picture, not the scene -- so it works on this game, and it stacks with whatever the Upscaler
+and Frame generation are set to. It runs once for each of the game's frames, on the part of the frame
+that is shown, before frame generation: the made frames are made from its picture. All of its rows take
+effect on the next frame.
+
+| Row | What it does |
+|---|---|
+| Neural rendering | The switch. Left out while HDR is Native (the model takes an SDR picture; HDR Expanded is made from its result) |
+| Backend | What runs the model: Auto, Streamline, NGX direct or Open (below) |
+| Model | How much work the model does per frame: Performance, Balanced, Quality (its default), DLAA |
+| Style | The look it aims for: Default, Natural, Cinematic |
+| Preset | Which trained network it uses: Default, or presets A to G |
+| Passes | How many times the model goes over each frame, 1 to 10, each pass on the picture of the one before: a stronger effect, at the model's whole cost (and video memory) again for every pass. Passes after the first leave Local tone out. NVIDIA's model only |
+| Resolution scale | The size the model works at, 50% to 100% of the picture's width and height. Below 100% it is given a smaller copy and its detail is added back at full size, so the picture stays as sharp as the game drew it: the cheapest way to more frames with the model on. Any backend |
+| Intensity | How much of the model's result is mixed into the frame |
+| Local tone, Local structure, Global tone | How far the model may move brightness and colour in a small area, how much fine detail it adds, and how far it may move the whole frame's tone |
+| Skin structure, Auto mask | Detail on characters' skin, and letting the model find the characters itself |
+
+These are the settings the RenoDX DLSS add-on offers for the same model (its style, pass count, processing scale,
+intensity, tone, structure, skin structure and character mask), under the names the model's own options have.
+
+**Three ways to the same network** (the **Backend** row, saved as `nr_backend`;
+`RX_VK_DLSS_NR_BACKEND=auto|streamline|ngx|open` over it for one run): **Streamline**, NVIDIA's plugin and the files in the
+table below; **NGX direct**, which asks NVIDIA's NGX for the feature itself, through the same NGX session DLSS uses, and
+needs only `nvngx_dlssnr.dll`; or **Open (OpenDLSS-NR)**, below, which runs the network on Vulkan without NVIDIA's runtime.
+**Auto** takes Streamline where it is attached and accepts the GPU, then NGX direct where it can run, then Open where a model
+folder is in place. The other rows apply to whichever runs.
+
+**Open (OpenDLSS-NR)** is [OpenDLSS-NR](https://github.com/maanHimself/OpenDLSS-NR) (MIT), a Vulkan implementation of the
+DLSS 5 NR network, built into the renderer on Windows and Linux alike: on Linux it is the way to the feature today. It
+needs an NVIDIA RTX 40 or 50 card for now (`VK_NV_cooperative_matrix2` and `VK_EXT_shader_float8`; the log names anything
+missing), and **a model folder you supply**: the network's weights, in OpenDLSS-NR's layout (`manifest.json` and its stage
+files), in a folder called `nr-model` in the game folder (or wherever `RX_VK_OPENNR_MODEL` points). **Hookshot includes no
+weights and no way to get them**; without a folder the Neural tab says so. Put the folder in place before starting the
+game: the GPU is set up for the network at the start. Its log lines start `vk: open NR`;
+[docs/neural-rendering.md](docs/neural-rendering.md) says what was measured (the kernels, against the network's own CPU
+reference, on synthetic weights) and what was not (image quality with real weights).
+
+**NGX direct** looks for `nvngx_dlssnr.dll` where NGX looks for DLSS's own runtime: the folder `RX_VK_DLSS_DIR` names, then
+the **`ngx` folder in the game folder**, then `%LOCALAPPDATA%\Hookshot\ngx`, then the game folder itself. On Linux NGX
+looks in the same places (`$XDG_DATA_HOME/hookshot/ngx` or `~/.local/share/hookshot/ngx` third) for
+`libnvidia-ngx-dlssnr.so`, which **NVIDIA has not shipped yet**: the Linux NGX core knows the feature, but NVIDIA's SDK has Linux libraries only for DLSS, Ray
+Reconstruction and Frame Generation. Until it does, the Neural tab and the log say so, and on Linux the way to the
+feature is the Windows build under Proton. NGX direct's log lines start `vk: DLSS 5 neural rendering (NGX direct)`; when
+NGX refuses it on Windows they name the GPU, the `nvngx_dlssnr.dll` found, whether it is signed, and the override, as the
+Streamline path's do.
+
+**Streamline is Windows x64 only**: it ships as DLLs.
+
+**RTX 50 with NVIDIA's own model; RTX 20, 30 and 40 with a patched one.** NVIDIA's `nvngx_dlssnr.dll` runs on RTX 50
+(Blackwell) only: on an older card NGX refuses it (`0xbad00001`) and the Neural tab says so. Community builds of the same
+file recompile its model for Turing, Ampere and Ada -- [dlssnr-patcher](https://github.com/dev-camo/dlssnr-patcher)
+patches your own copy, and [openNR](https://github.com/clshortfuse/openNR)'s 310.9.16 compatibility build (an FP16 one,
+reported much faster on RTX 30 and 40) is reconstructed from it. Hookshot loads whichever `nvngx_dlssnr.dll` is there.
+Two things to know:
+
+- A patched file has **no NVIDIA signature**, and NVIDIA's NGX loads an unsigned feature only with its signature override
+  on: the DWORD `EnableSignatureOverride` = `1` under `HKEY_LOCAL_MACHINE\SOFTWARE\NVIDIA Corporation\Global\NGXCore`.
+  Hookshot reads it, for the log, and never sets it: that is your choice to make. It applies to every program on the
+  PC, so turn it back off when you are done, and keep patched DLLs away from games with anti-cheat.
+- It costs more on older cards: about 1.5 times an RTX 5070 Ti's GPU time on an RTX 4070 SUPER, by one report.
+
+When Streamline refuses the feature, the log's `vk: DLSS 5 neural rendering is not supported here` line names the GPU, whether
+the `nvngx_dlssnr.dll` there is NVIDIA's or a patched one, and whether the override is set, and the line after it says
+what is missing.
+
+For Streamline, these files go beside the game, or in a `streamline` folder beside it, or wherever
+`RX_VK_STREAMLINE_DIR` points. They are NVIDIA's to ship; Hookshot builds against Streamline's
+MIT-licensed headers only and loads nothing it has not checked NVIDIA's signature on:
+
+| file | what it is |
+|---|---|
+| `sl.interposer.dll` | Streamline's loader |
+| `sl.common.dll`, `sl.pcl.dll` | the interposer needs both, whichever feature loads on top |
+| `sl.dlss_nr.dll` | the neural rendering plugin |
+| `nvngx_dlssnr.dll` | the model -- it must sit in the same folder as `sl.dlss_nr.dll` |
+
+Keep the three `sl.*` files from one Streamline release: mixing versions is not a supported
+combination. Streamline **2.14.1 or newer** -- older releases do not have the feature at all.
+[docs/neural-rendering.md](docs/neural-rendering.md) has the whole picture, including what is
+measured and what is not.
 
 ## Mods
 
@@ -765,9 +773,11 @@ interpolation can make the frame in between with `RX_VK_FSR_FG=1` (opt-in: the g
 and FSR 3.1 has no HUD-less colour to keep it still, so the HUD smears; by default the renderer's own makes it). Both are AMD's FidelityFX
 SDK 1.1.4 shaders (`third_party/fidelityfx-sdk`, MIT), compiled into the renderer: no AMD runtime or DLL is needed, and
 the row offers FSR 3.1 on any Vulkan 1.3 GPU with push descriptors, extended storage image formats and storage writes
-without a format (`vk: fsr3: ... can run on this GPU` in the log). Its inputs are the scene's colour, its depth, motion
-from the camera, and the same camera jitter DLSS uses (`RX_VK_FSR_JITTER=0` turns it off); things that move by
-themselves can trail for now.
+without a format (`vk: fsr3: ... can run on this GPU` in the log). It upscales on the same inputs as DLSS and FSR 4: the
+scene's colour, its depth, motion from the camera with the skinned characters' own drawn over it (Link, his shield and
+the people around him keep their outline while they move), and the same camera jitter (`RX_VK_FSR_JITTER=0` turns it
+off). Things that move by themselves and are not skinned (Navi's body, props) can still trail. `RX_VK_FSR3_CHAIN=0` gives
+it the camera's motion alone, as before.
 
 </details>
 
@@ -793,9 +803,11 @@ license. Never share a game folder built with them, and do not post builds made 
   sure no other folder has a newer one). Never copy NGX's core, `_nvngx.dll`, beside the game: it comes with NVIDIA's
   driver.
 - **Linux, the Hookshot Builder (the AppImage):** the same tick as on Windows, and nothing else to do: no variable is
-  passed to the AppImage and no file is copied by hand. The build downloads the SDK into
-  `$XDG_DATA_HOME/hookshot/builder/ngx-sdk` (`~/.local/share/hookshot/builder/ngx-sdk`), builds the game with it and
-  puts DLSS's runtime, `libnvidia-ngx-dlss.so.<version>`, in the game folder's `ngx` folder.
+  passed to the AppImage and no file is copied by hand. The build downloads the SDK into the builder's cache folder,
+  `$XDG_CACHE_HOME/hookshot-builder/ngx-sdk` (`~/.cache/hookshot-builder/ngx-sdk`), builds the game with it and puts
+  DLSS's runtime, `libnvidia-ngx-dlss.so.<version>`, in the game folder's `ngx` folder. The builder's settings
+  (`~/.config/hookshot/builder.ini`) remember that you accepted NVIDIA's license, so an update keeps DLSS even after the
+  cache was emptied: it downloads the SDK again.
 - **Linux, a build from source:** `scripts/linux/ngx-sdk.sh <sdk folder>` (it runs `scripts/ngx_sdk.py --platform
   linux`) asks you to accept NVIDIA's license and fetches `libnvsdk_ngx.a` for the build and
   `libnvidia-ngx-dlss.so.<version>`, DLSS's runtime. Then run the build with `HOOKSHOT_NGX_SDK=<sdk folder>` set:

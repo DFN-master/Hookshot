@@ -24,6 +24,13 @@ int main() {
                                             effective(AUTO, 0) == AUTO);
     CHECK("a choice that does not run is Auto", effective(FSR4, fsr3) == AUTO && effective(FSR3, 0) == AUTO &&
                                                     effective(7, all) == AUTO && effective(-1, all) == AUTO);
+    // a value asked for: the arrows ask the one beside, the control bridge any one
+    CHECK("a value that runs is taken as asked", pick(AUTO, FSR3, 1, fsr3) == FSR3 && pick(FSR3, AUTO, -1, fsr3) == AUTO &&
+                                                     pick(AUTO, BUILTIN, 1, 0) == BUILTIN && pick(BUILTIN, FSR4, 1, all) == FSR4);
+    CHECK("one that does not run: the next that does, the way asked", pick(BUILTIN, FSR4, 1, fsr3) == FSR3 &&
+                                                                          pick(FSR3, FSR4, -1, fsr3) == BUILTIN);
+    CHECK("past the ends: around", pick(FSR3, 4, 1, all) == AUTO && pick(AUTO, -1, -1, all) == FSR3 &&
+                                       pick(BUILTIN, 2, 1, 0) == AUTO && pick(AUTO, -1, -1, 0) == BUILTIN);
     // what runs here: the most frames each of AMD's makes between two of the game's (0: it does not run)
     Here none, linux_pc, amd, every;
     linux_pc.most[FSR3] = 1;

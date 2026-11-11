@@ -56,6 +56,14 @@ inline int step(int v, int dir, unsigned available) {
     return AUTO;
 }
 
+/// The row's value when `want` is asked from `from` (set_row: an arrow asks the value beside, the control bridge any
+/// value): `want` itself where it can be chosen here, else the next one that can in the direction asked
+inline int pick(int from, int want, int dir, unsigned available) {
+    available |= always();
+    if (want >= 0 && want < kMethods && (available & bit(want))) return want;
+    return step(from, dir, available);
+}
+
 /// The value shown and used: the one chosen when it runs here, else Auto (a saved choice is kept for a PC where it runs)
 inline int effective(int chosen, unsigned available) {
     available |= always();

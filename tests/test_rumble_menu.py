@@ -88,8 +88,8 @@ struct { void note(const int*) {} } restart_state;
 bool can_mic() { return false; }
 /* (the Upscaler row's choices, which set_row steps through: the game's own only, here) */
 unsigned upscalers_available() { return 1; }
-/* (hookshot fork: the Frame generation by row's stepping, which set_row calls: upstream's two values here) */
-int framegen_by_step(int v, int) { return v ? 0 : 1; }
+/* (hookshot fork: the Frame generation by row's choice, which set_row calls: upstream's two values here) */
+int framegen_by_pick(int, int want, int) { return want & 1; }
 void mic_chosen() {}
 void samplers_changed() {}
 void prompts_at_once(const Row&) {}

@@ -43,13 +43,52 @@ DLSS_LICENSE = (
 )
 
 
+def cache_dir():
+    """The builder's own folder on Linux, as make_game.py's work folder: $XDG_CACHE_HOME/hookshot-builder (~/.cache/...)"""
+    return os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "hookshot-builder")
+
+
 def ngx_sdk_dir():
-    """Where NVIDIA's DLSS SDK goes when the player ticks NVIDIA DLSS: beside the builder's versions, kept across updates."""
+    """Where NVIDIA's DLSS SDK goes when the player ticks NVIDIA DLSS: the builder's cache folder, as on Windows its own folder
+    (%LOCALAPPDATA%\\HookshotBuilder\\ngx-sdk). A download, fetched again by the next build with DLSS when the cache was emptied;
+    whether NVIDIA's license was accepted is kept in the builder's settings (license_accepted), not in it"""
+    return os.path.join(cache_dir(), "ngx-sdk")
+
+
+def old_ngx_sdk_dir():
+    """Where the SDK went before: the game's data folder ($XDG_DATA_HOME/hookshot/builder/ngx-sdk), beside the builder's versions"""
     return os.path.join(linux_update.data_root(), "ngx-sdk")
 
 
+def license_accepted(cfg=None):
+    """Whether the player accepted NVIDIA's license here: the builder's settings say so (nvidia_license=1), or the SDK it was
+    accepted for is still where builders before the record kept it"""
+    cfg = load_config() if cfg is None else cfg
+    return cfg.get("nvidia_license") == "1" or os.path.isfile(os.path.join(old_ngx_sdk_dir(), "LICENSE.txt"))
+
+
+def move_old_ngx_sdk():
+    """(once) The SDK a builder before kept in the game's data folder moved to the cache folder, and the license it was accepted
+    under recorded in the settings. When it cannot move it is left: the next build with DLSS downloads it again"""
+    old, new = old_ngx_sdk_dir(), ngx_sdk_dir()
+    if not os.path.isfile(os.path.join(old, "LICENSE.txt")):
+        return
+    cfg = load_config()
+    if cfg.get("nvidia_license") != "1":
+        cfg["nvidia_license"] = "1"
+        save_config(cfg)
+    if os.path.exists(new):
+        shutil.rmtree(old, ignore_errors=True)
+        return
+    try:
+        os.makedirs(os.path.dirname(new), exist_ok=True)
+        shutil.move(old, new)
+    except OSError:
+        pass
+
+
 def folder_has_dlss(folder):
-    """Whether a game folder was built with NVIDIA DLSS (its runtime in ngx/, and NVIDIA's license in ngx-sdk)."""
+    """Whether a game folder was built with NVIDIA DLSS: its runtime in ngx/, and NVIDIA's license accepted here."""
     if not folder:
         return False
     ngx_dir = os.path.join(os.path.expanduser(folder), "ngx")
@@ -57,7 +96,7 @@ def folder_has_dlss(folder):
         has_runtime = any(name.startswith("libnvidia-ngx-dlss.so") for name in os.listdir(ngx_dir))
     except OSError:
         return False
-    return has_runtime and os.path.isfile(os.path.join(ngx_sdk_dir(), "LICENSE.txt"))
+    return has_runtime and license_accepted()
 
 
 def dlss_args(dlss):
@@ -343,6 +382,7 @@ class Builder(tk.Tk):
         self.apply_scale()
         self.apply_theme()
         self.minsize(self.px(760), self.px(520))
+        move_old_ngx_sdk()   # (before the settings are read: it may record the license in them)
         self.cfg = load_config()
         self.proc = None
         self.lines = queue.Queue()
@@ -803,6 +843,8 @@ class Builder(tk.Tk):
             self.dlss.set(False)
         else:
             self.dlss_toggled = True
+            if self.dlss.get():
+                self.cfg["nvidia_license"] = "1"   # (kept apart from the SDK, which is in the cache: folder_has_dlss)
         self.cfg["dlss"] = "1" if self.dlss.get() else "0"
         save_config(self.cfg)
         self.apply_mode()
@@ -1074,6 +1116,7 @@ class Builder(tk.Tk):
         self.proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      text=True, bufsize=1, encoding="utf-8", errors="replace", start_new_session=True, **env_kw)
         threading.Thread(target=self.read, args=(self.proc,), daemon=True).start()
+        self.tick()
 
     def read(self, proc):
         for line in proc.stdout:
@@ -1088,6 +1131,7 @@ class Builder(tk.Tk):
         self.compile_started = None
         self.times = None
         self.shaders_later = False
+        self.built = self.error = None   # (this run's own: what make_game.py says, or Cancel)
         px = self.px
         page = self.page = ttk.Frame(self)
         page.pack(fill="both", expand=True)
@@ -1126,7 +1170,6 @@ class Builder(tk.Tk):
         self.buttons.grid(row=4, column=0, sticky="e", pady=(px(14), 0))
         ttk.Button(self.buttons, text="Cancel", command=self.cancel, cursor="hand2").pack(side="right")
         self.stage_text.set("Starting")
-        self.tick()
 
     def tick(self):
         if self.proc and self.proc.poll() is None:
@@ -1229,6 +1272,7 @@ class Builder(tk.Tk):
 
     def on_exit(self, code):
         self.proc = None
+        self.time_text.set("")   # (the clock and its countdown are a running build's; the line above says how it ended)
         for w in self.buttons.winfo_children():
             w.destroy()
         folder = getattr(self, "built", None)
@@ -1256,7 +1300,7 @@ class Builder(tk.Tk):
             self.stage_label.configure(style="Go.Stage.TLabel")
             self.set_step(2)
         else:
-            self.stage_text.set("The build stopped: %s" % getattr(self, "error", "see the lines above"))
+            self.stage_text.set("The build stopped: %s" % (getattr(self, "error", None) or "see the lines above"))
             ttk.Button(self.buttons, text="Back", command=self.show_form, cursor="hand2").pack(side="right", padx=self.px(4))
             self.heading.configure(text="The build stopped")
             self.stage_label.configure(style="Bad.Stage.TLabel")
