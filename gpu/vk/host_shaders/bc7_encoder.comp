@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: Copyright 2026 Douglas F
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// NOT a Nintendo file, and nothing in it comes from the game. Hookshot's own BC7 encoder, compiled to
+// bc7_encoder_comp_spv.h by scripts/host_shaders.py (glslang, vulkan1.1).
+//
 // BC7 (mode 6) encoder for the Vulkan back end's big ASTC textures (vk_texture.cpp).
 //
 // The same block a BC3 texture gets, at the same 16 bytes: the 4x4 texels are fitted along their
@@ -135,13 +141,29 @@ uvec4 encode_block(const int px[16][4]) {
             for (int b = 0; b < 4; ++b) cov[a][b] += d[a] * d[b];
     }
     float axis[4] = {cov[0][0], cov[1][1], cov[2][2], cov[3][3]};
+    bool restarted = false;
     for (int it = 0; it < 8; ++it) {
         float n[4] = {0.0, 0.0, 0.0, 0.0};
         for (int a = 0; a < 4; ++a)
             for (int b = 0; b < 4; ++b) n[a] += cov[a][b] * axis[b];
         float m = 0.0;
         for (int a = 0; a < 4; ++a) m = max(m, abs(n[a]));
-        if (m < 1e-6) break;
+        if (m < 1e-6) {
+            // (the diagonal can be exactly orthogonal to the principal axis: R and G anticorrelated with equal
+            // variance, B and A constant. Restart once from the covariance row with the largest norm.)
+            if (restarted) break;
+            int row = 0;
+            float best = 0.0;
+            for (int a = 0; a < 4; ++a) {
+                float l = 0.0;
+                for (int b = 0; b < 4; ++b) l += cov[a][b] * cov[a][b];
+                if (l > best) best = l, row = a;
+            }
+            if (best < 1e-12) break;
+            for (int a = 0; a < 4; ++a) axis[a] = cov[row][a];
+            restarted = true;
+            continue;
+        }
         for (int a = 0; a < 4; ++a) axis[a] = n[a] / m;
     }
     float len = 0.0;
