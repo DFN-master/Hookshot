@@ -56,10 +56,11 @@ def main():
     # (the frame reaches the open backend through the Backend row's one dispatch point, nr::apply in vk_dlssnr_ngx.cpp:
     #  its fourth value, Open, and Auto's fall to it; vk_dlssnr.cpp's apply() is Streamline's alone)
     ngx = (VK / "vk_dlssnr_ngx.cpp").read_text(encoding="utf-8")
-    nr_apply = blocks(ngx, "VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, VkImageView* out_view) {\n    static int told")
+    nr_apply = blocks(ngx, "VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView* out_view,\n              uint32_t* out_w, uint32_t* out_h) {\n    static int told")
     if len(nr_apply) != 1:
         fail("vk_dlssnr_ngx.cpp: nr::apply not found")
-    if "if (b == OPEN) return opennr::apply(cmd, src, sw, sh, out_view);" not in nr_apply[0][1]:
+    # (through the one lambda that calls whichever backend runs, on the frame or on the Resolution scale's smaller copy)
+    if "if (b == OPEN) return opennr::apply(cmd, from, w, h, view);" not in nr_apply[0][1]:
         fail("nr::apply does not hand the frame to the open backend when it is the one running")
     if "opennr::ready()" not in ngx:
         fail("the Backend row's Auto never falls to the open backend (nr::running_backend)")

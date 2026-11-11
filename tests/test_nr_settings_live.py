@@ -62,6 +62,8 @@ def block(text, marker, name):
 PROGRAM = r"""
 #include <cstdio>
 #include <cmath>
+#include "NR_PLAN_H"   // (the Passes row's count, as vk_menu.h includes it)
+using namespace mkwvk;
 static int bad;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL: %s\n", #c); ++bad; } } while (0)
 
@@ -69,6 +71,7 @@ struct Options {
     int nr = 0, nr_model = 2, nr_style = 0, nr_preset = 0;
     int nr_intensity = 100, nr_local_tone = 100, nr_local_structure = 100, nr_global_tone = 100;
     int nr_skin = 100, nr_auto_mask = 0;
+    int nr_passes = 1, nr_scale = 100;
 };
 static Options opts;
 
@@ -104,6 +107,19 @@ int main() {
     opts.nr_auto_mask = 0; CHECK(!nr_settings().auto_mask);
     opts.nr_auto_mask = 1; CHECK(nr_settings().auto_mask);
 
+    // The Passes row: 1 to 10, read each call like the rest (a file from before the row: 1).
+    opts.nr_passes = 1;  CHECK(nr_settings().passes == 1u);
+    opts.nr_passes = 4;  CHECK(nr_settings().passes == 4u);
+    opts.nr_passes = 0;  CHECK(nr_settings().passes == 1u);
+    opts.nr_passes = 99; CHECK(nr_settings().passes == 10u);
+    {   // (a change of the row is a change of the settings: the backends make their features again)
+        opts.nr_passes = 1;
+        const NrSettings one = nr_settings();
+        opts.nr_passes = 2;
+        CHECK(!(one == nr_settings()));
+        opts.nr_passes = 1;
+    }
+
     // Style and preset pass through as the plugin's own numbers.
     opts.nr_style = 2;  CHECK(nr_settings().style == 2u);
     opts.nr_preset = 7; CHECK(nr_settings().preset == 7u);
@@ -127,6 +143,7 @@ def check_mapping(cxx):
     struct = block(text, "struct NrSettings", "vk_menu.h's NrSettings")
     accessor = block(text, "inline NrSettings nr_settings()", "vk_menu.h's nr_settings()")
     source = PROGRAM.replace("__STRUCT__", struct + ";").replace("__ACCESSOR__", accessor)
+    source = source.replace("NR_PLAN_H", str(ROOT / "gpu" / "vk" / "nr_plan.h"))
     with tempfile.TemporaryDirectory(prefix="hookshot-nr-settings-") as temp:
         src = pathlib.Path(temp) / "nr_settings.cpp"
         exe = pathlib.Path(temp) / "nr_settings"

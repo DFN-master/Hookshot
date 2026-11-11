@@ -1,5 +1,5 @@
 // (hookshot fork) AMD FSR 4's frame generation, through AMD's own runtime and its FSR API (the "FidelityFX API":
-// third_party/ffx-api): the Frame generation method row's "AMD FSR 4" (framegen_methods.h, vk_framegen.cpp).
+// third_party/ffx-api): the Frame generation by row's "AMD FSR 4" (framegen_methods.h, vk_framegen.cpp).
 //
 // FSR 4's upscaler is upstream's engine on the temporal chain (gpu/vk/vk_fsr4.cpp, the Upscaler row's AMD FSR 4 and its
 // native AA); this fork's own upscale through the same runtime is gone with it. What is here is what upstream has not:
@@ -37,7 +37,7 @@ struct FrameInputs {
     float far_plane = 0.0f;   ///< 0 or FLT_MAX: infinite (FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE); the scene's is 1000.5
     float fov_y = 60.0f * 3.14159265358979f / 180.0f;
     float frame_time_ms = 16.667f;
-    /// The camera in the world (dlssg_math.h Camera: forward is the way it looks)
+    /// The camera in the world (camera_vectors.h: forward is the way it looks)
     float camera_position[3]{}, camera_right[3]{}, camera_up[3]{}, camera_forward[3]{};
     bool reset = false;
     uint32_t frames = 1;   ///< how many to make between the last frame and this one (1 to max_frames())

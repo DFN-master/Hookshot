@@ -49,9 +49,14 @@ int saves = 0;
 void save() { ++saves; }
 void apply_pad_layout(int) {}
 void sync_preset_budgets(int) {}
+void env_release(const int*) {}   // (the environment's hold on a row: none here)
+void vram_budget_sync() {}
+constexpr int kVramMinimumOnly = 1;
 bool row_fixed(const int*) { return false; }
 int upscaler() { return 0; }
 unsigned upscalers_available() { return 1; }
+// (hookshot fork: the Frame generation by row's stepping, which set_row calls: upstream's two values here)
+int framegen_by_step(int v, int) { return v ? 0 : 1; }
 namespace ur {
 int snap(int, int value) { return value; }
 int snap_render(int, int value) { return value; }   // (the slider)
@@ -66,6 +71,7 @@ struct { void note(const int*) {} } restart_state;
 bool can_mic() { return false; }
 void mic_chosen() {}
 void samplers_changed() {}
+void prompts_at_once(const Row&) {}
 int step_output_choice(int id, int dir) { return id + dir; }
 const char* tx_framegen(int) { return ""; }
 const char* hn_framegen(int, int) { return ""; }

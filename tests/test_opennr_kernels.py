@@ -22,6 +22,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import opennr_kernels  # noqa: E402
 
+RUN_ALL_ARGS = ["--glslang", "{glslang}", "--spirv-val", "{spirv_val}"]
+RUN_ALL_SKIP = {"windows": "needs spirv-val: checked on Linux"}
+
 
 def fail(text):
     print("FAIL: " + text)
@@ -39,7 +42,7 @@ def main():
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     out = r.stdout.decode("utf-8", "replace")
     print(out.strip())
-    want = "13 kernels, %d khr variants and 2 frame passes match" % len(opennr_kernels.KHR_VARIANTS)
+    want = "13 kernels, %d khr variants and 3 frame passes match" % len(opennr_kernels.KHR_VARIANTS)
     if r.returncode or want not in out:
         fail("the checked-in SPIR-V headers do not match their sources (python -I -B scripts/opennr_kernels.py)")
 

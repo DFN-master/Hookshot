@@ -46,7 +46,9 @@ GENERATORS = UPSTREAM / "scripts" / "ptx"
 OUT = ROOT / "gpu" / "vk" / "shaders"
 KERNEL_HEADER = OUT / "opennr_kernels_spv.h"
 # (the renderer's own passes around the network: name -> the glslang variable name of its header)
-FRAME_SHADERS = {"opennr_pre": "OPENNR_PRE_COMP_SPV", "opennr_post": "OPENNR_POST_COMP_SPV"}
+FRAME_SHADERS = {"opennr_pre": "OPENNR_PRE_COMP_SPV", "opennr_post": "OPENNR_POST_COMP_SPV",
+                 # (neural rendering's Resolution scale, whichever backend runs: gpu/vk/vk_nr_scale.cpp)
+                 "nr_detail": "NR_DETAIL_COMP_SPV"}
 
 # The thirteen modules nr::Kernels loads (third_party/opendlss-nr/src/kernels.cpp, its constructor), in its order.
 KERNELS = ["gemm_fp8", "gemm_f16", "ops", "window_normalize", "window_attend", "global_normalize", "global_attend",

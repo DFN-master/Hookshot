@@ -1,5 +1,5 @@
-"""The Insert menu's Frame generation method row (gpu/vk/framegen_methods.h): its stepping, what a choice means, and that
-the menu and vk_framegen.cpp use those rules rather than their own. No game or GPU required.
+"""The Insert menu's Frame generation by row (gpu/vk/framegen_methods.h): upstream's two values and AMD's two after them,
+its stepping, and that the menu and vk_framegen.cpp use those rules rather than their own. No game or GPU required.
 
 python -I -B tests/test_framegen_methods.py [--cxx g++]
 """
@@ -24,25 +24,31 @@ def main():
         subprocess.run([str(exe)], check=True)
     menu = (ROOT / "gpu" / "vk" / "vk_menu.cpp").read_text(encoding="utf-8")
     fg = (ROOT / "gpu" / "vk" / "vk_framegen.cpp").read_text(encoding="utf-8")
+    fi = (ROOT / "gpu" / "vk" / "vk_fsr3fi.cpp").read_text(encoding="utf-8")
     for needle, where, what in (
-            ('"Frame generation method", &opts.framegen_method', menu, "the row"),
-            ("framegen_methods::step(", menu, "set_row stepping through framegen_methods.h"),
-            ("fgm::effective(", menu, "the row showing the method in effect"),
-            ("fgm::effective(chosen, fgm::available(here))", fg, "vk_framegen.cpp choosing through framegen_methods.h"),
-            ("fgm::first(method, here, m)", fg, "the method that makes the set, only one that makes it whole (FSR 3.1: 2x)"),
-            ("dlssg::max_frames()", fg, "DLSS frame generation within what NGX makes here"),
+            ('"Frame generation by", &opts.framegen_by, 0, framegen_methods::kMethods - 1', menu, "the row, with AMD's values"),
+            ("return fgm::step(fgm::effective(v, framegen_by_available()), dir, framegen_by_available());", menu,
+             "the row stepping through framegen_methods.h"),
+            ("if (r.value == &opts.framegen_by) v = framegen_by_step(*r.value, dir);", menu, "set_row stepping that way"),
+            ("return t[fgm::effective(v, framegen_by_available())];", menu, "the row showing the value in effect"),
+            ("opts.framegen_by = fgm::from_old(old_method)", menu, "an older file's Frame generation method"),
+            ("fgm::effective(env_method >= 0 ? env_method : opts.framegen_by, fgm::available(framegen_here()))", fg,
+             "vk_framegen.cpp choosing through framegen_methods.h"),
             ("ffx::max_frames()", fg, "FSR 4 frame generation within its limit"),
-            ("which == fgm::DLSS ? dlssg_frames(", fg, "DLSS frame generation making the set"),
-            ("ffx_frames(cmd, set, cur, uw, uh, m - 1", fg, "FSR 4 frame generation making the set"),
-            ("which == fgm::FSR3", fg, "FSR 3.1 frame generation making the set"),
-            ("scene_inputs_asked.store(which != fgm::BUILTIN", fg, "the scene's inputs made when a vendor method takes them"),
-            ("fgm::first(", menu, "the Frame generation row's hint naming the method that makes the frames")):
+            ("set->made = dlss_fg_frames(", fg, "upstream's DLSS Frame Generation first, as upstream has it"),
+            ("if (set->made == 0 && blend && m > 1 && ffx_set_wanted(m)) set->made = ffx_frames(cmd, *set, cur, uw, uh, m - 1);",
+             fg, "FSR 4 frame generation making the sets it makes whole, after DLSS's and before the renderer's own"),
+            ("return opts.framegen_by == framegen_methods::FSR3 ? 1u : 0u;", fi, "the row's AMD FSR 3.1 asking for it")):
         if needle not in where:
             raise SystemExit("missing: %s (%s)" % (what, needle))
+    # (DLSS Frame Generation is Auto's alone: vk_dlss.cpp's fg_asked reads the row as upstream wrote it)
+    dlss = (ROOT / "gpu" / "vk" / "vk_dlss.cpp").read_text(encoding="utf-8")
+    if "return fg_possible() && (forced || opts.framegen_by == 0);" not in dlss:
+        raise SystemExit("vk_dlss.cpp fg_asked no longer reads Frame generation by's Auto as 0")
     # (the choice is read each frame, so the menu's change reaches the next frame: not cached in a static)
     if "static const int chosen" in fg or "static int chosen" in fg:
         raise SystemExit("vk_framegen.cpp caches the method: a change in the menu would wait for a restart")
-    print("PASS: the menu and frame generation take the method from framegen_methods.h, read live")
+    print("PASS: the menu and frame generation take the row's value from framegen_methods.h, read live")
 
 
 if __name__ == "__main__":

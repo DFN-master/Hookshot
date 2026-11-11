@@ -25,7 +25,8 @@ def production_code(path):
     # here -- it gates -DRX_VK_STREAMLINE and an include path.
     # (opennr_jobs: open neural rendering's sources, which the branch adds; without third_party/opendlss-nr, as in
     # this fixture's tree, it adds none)
-    names = {"tree_headers", "vk_sources", "flag_text", "object_key", "streamline_sdk_path", "opennr_jobs"}
+    names = {"tree_headers", "vk_sources", "flag_text", "object_key", "streamline_sdk_path", "opennr_jobs",
+             "zstd_jobs"}
     functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
     assert {n.name for n in functions} == names
     main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
@@ -105,7 +106,7 @@ class ShaderStampCacheTests(unittest.TestCase):
             "spirv_headers": str(self.root / "deps/spirv-headers"),
             "vk_headers": str(self.root / "deps/vulkanheaders"),
             "vma_headers": str(self.root / "deps/vulkanmemoryallocator"),
-            "obj_dir": str(self.root / "obj"), "cc": "clang", "jobs": [],
+            "obj_dir": str(self.root / "obj"), "cc": "clang", "jobs": [], "ZSTD": str(self.root / "third_party/zstd/lib"),
             "stamp_def": '-DHOOKSHOT_VERSION="%s"' % version, "logo_text": b"", "gen_dir": str(self.root / "gen"),
             "fonts_cpp": str(self.root / "gen/ui_fonts.cpp"),
             # (the back end's branch makes its logo header and fonts file itself since #1567: no files written here)

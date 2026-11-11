@@ -67,8 +67,12 @@ enum Backend : int { AUTO = 0, STREAMLINE = 1, NGX = 2, OPEN = 3 };   // (OPEN: 
 /// Whether neural rendering is switched on (the Neural tab's row, or RX_VK_DLSS_NR over it): read live, each frame.
 [[nodiscard]] bool wanted();
 
-/// The present's one call: the running backend's apply.
-[[nodiscard]] VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, VkImageView* out_view);
+/// The present's one call: the running backend over the picture, which is the crop's part of `src` (GENERAL, sw x sh;
+/// vk_present_rect.h present_source_rect), at the Resolution scale row's size (vk_nr_scale.h). The image to show in the
+/// picture's place (GENERAL, the whole of it the picture), its view in `out_view` and its size in `out_w` x `out_h`;
+/// VK_NULL_HANDLE when the model did not run, and the caller presents `src` as it would have.
+[[nodiscard]] VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, const int crop[4],
+                            VkImageView* out_view, uint32_t* out_w, uint32_t* out_h);
 
 /// Why the running backend cannot run, for the menu: "" while it can or is not known yet.
 [[nodiscard]] const char* why();

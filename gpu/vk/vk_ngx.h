@@ -1,11 +1,11 @@
 // (hookshot) The one NGX session the DLSS backends share.
 //
 // NGX initializes once per process and hands back one capability-parameter block for every feature
-// it knows, so three backends that each loaded and initialized it would be three bugs: a second
+// it knows, so backends that each loaded and initialized it would each be a bug: a second
 // NVSDK_NGX_VULKAN_Init over a live session, a second set of parameters, and a shutdown by whichever
-// one finished first. Super Resolution (gpu/vk/vk_dlss.h), Frame Generation (gpu/vk/vk_dlssg.h) and
-// Ray Reconstruction all come through here instead, and each one owns nothing but its own feature
-// handle.
+// one finished first. The session is gpu/vk/vk_dlss.cpp's (super resolution and frame generation, both
+// upstream's, are made there); DLSS 5 neural rendering through NGX (gpu/vk/vk_dlssnr_ngx.h) comes
+// through here and owns nothing but its own feature handle.
 //
 // Nothing of NVIDIA's is in this repository and nothing of NVIDIA's is needed to build it: this
 // whole file is inside the build-time gate `HOOKSHOT_NGX`, which names the builder's own copy of

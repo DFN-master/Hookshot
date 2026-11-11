@@ -10,8 +10,11 @@
 #include <cstring>
 #include <string>
 
+#include "nr_plan.h"       // (the Passes and Resolution scale rows)
 #include "vk_dlssnr.h"
 #include "vk_menu.h"
+#include "vk_nr_scale.h"   // (the picture's part of the frame, and the Resolution scale: whichever backend runs)
+#include "vk_present_rect.h"
 #include "vk_streamline.h"
 
 #if defined(HOOKSHOT_NGX)
@@ -27,6 +30,7 @@
 #endif
 #endif
 #endif
+#include "vk_work.h"   // (after the others: its commands through the recorder, counted as work for full_barrier)
 
 namespace mkwvk::dlssnr_ngx {
 namespace {
@@ -79,9 +83,14 @@ struct State {
     bool probed{}, ok{};
     std::string why;
     NVSDK_NGX_Parameter* params{};
-    NVSDK_NGX_Handle* feature{};
+    // One feature a pass (nr_plan.h: each keeps its own history). features: how many were made; features_asked: for how
+    // many passes, which is more when NGX would not make them all (video memory): the row is then not asked again for
+    // the same count at every frame
+    NVSDK_NGX_Handle* feature[nr_plan::kMaxPasses]{};
+    unsigned features{}, features_asked{};
     uint32_t feature_w{}, feature_h{};
     unsigned feature_preset{}, feature_quality{};
+    // (in and out are the pair the passes read and write in turn: nr_plan.h reads / writes)
     Image in{}, out{}, depth{}, motion{};
     uint32_t width{}, height{};
     bool scene_cleared{};
@@ -373,26 +382,15 @@ void refused(State& s, const NrSettings& want, uint32_t w, uint32_t h) {
     }
 }
 
-void release_feature(State& s) {
-    if (!s.feature) return;
+void release_features(State& s) {
+    if (!s.features) return;
     idle();
-    ngx::release_feature(s.feature);
-    s.feature = nullptr;
+    for (unsigned i = 0; i < s.features; i++) ngx::release_feature(s.feature[i]), s.feature[i] = nullptr;
+    s.features = s.features_asked = 0;
 }
 
-/// The feature, made for this size, preset and quality: those are creation parameters, so a change of any of them makes
-/// it again. Creation records into `cmd`.
-bool ensure_feature(State& s, VkCommandBuffer cmd, const NrSettings& want, uint32_t w, uint32_t h) {
-    if (s.feature && s.feature_w == w && s.feature_h == h && s.feature_preset == want.preset &&
-        s.feature_quality == want.quality)
-        return true;
-    release_feature(s);
-    if (!s.params) s.params = ngx::allocate_params();
-    if (!s.params) {
-        s.failed.store(true, std::memory_order_relaxed);
-        return false;
-    }
-    NVSDK_NGX_Parameter* p = s.params;
+/// The parameters a feature is made with, for this size, preset and quality.
+void set_creation(NVSDK_NGX_Parameter* p, const NrSettings& want, uint32_t w, uint32_t h) {
     NVSDK_NGX_Parameter_SetUI(p, NVSDK_NGX_Parameter_CreationNodeMask, 1u);
     NVSDK_NGX_Parameter_SetUI(p, NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
     set_sizes(p, w, h);
@@ -405,26 +403,52 @@ bool ensure_feature(State& s, VkCommandBuffer cmd, const NrSettings& want, uint3
     NVSDK_NGX_Parameter_SetF(p, "DLSSNR.ScalingRatio", 1.0f);
     NVSDK_NGX_Parameter_SetF(p, "DLSSNR.Scale", 1.0f);
     NVSDK_NGX_Parameter_SetI(p, "DLSSNR.Upscaling", 0);
-    NVSDK_NGX_Handle* handle = nullptr;
-    const NVSDK_NGX_Result res = ngx::create_feature(cmd, kFeature, p, &handle);
-    if (NVSDK_NGX_FAILED(res) || !handle) {
-        logf("vk: DLSS 5 neural rendering (NGX direct): CreateFeature(18) refused %ux%u, preset %u, quality %u (%#x)", w,
-             h, want.preset, want.quality, (unsigned)res);
-        if (res == NVSDK_NGX_Result_FAIL_PlatformError)
-            logf("vk:   FAIL_PlatformError: usually a device made without the feature's extensions (the \"dlss-nr wants\" "
-                 "lines at start-up), or a model file this GPU cannot run");
-        explain(s, (unsigned)res, false, 0, 0);
-        if (handle) ngx::release_feature(handle);
-        refused(s, want, w, h);
+}
+
+/// The features, one a pass (the Passes row), made for this size, preset and quality: those are creation parameters, so
+/// a change of any of them, or of the count, makes them again. Creation records into `cmd`. False when not even the
+/// first could be made; when a later one could not (each holds the model's memory again), the passes that were made run
+/// and the log says how many.
+bool ensure_features(State& s, VkCommandBuffer cmd, const NrSettings& want, uint32_t w, uint32_t h) {
+    if (s.features && s.features_asked == want.passes && s.feature_w == w && s.feature_h == h &&
+        s.feature_preset == want.preset && s.feature_quality == want.quality)
+        return true;
+    release_features(s);
+    if (!s.params) s.params = ngx::allocate_params();
+    if (!s.params) {
+        s.failed.store(true, std::memory_order_relaxed);
         return false;
     }
-    s.feature = handle;
+    NVSDK_NGX_Parameter* p = s.params;
+    for (unsigned pass = 0; pass < want.passes; pass++) {
+        set_creation(p, want, w, h);
+        NVSDK_NGX_Handle* handle = nullptr;
+        const NVSDK_NGX_Result res = ngx::create_feature(cmd, kFeature, p, &handle);
+        if (NVSDK_NGX_FAILED(res) || !handle) {
+            if (handle) ngx::release_feature(handle);
+            if (pass) {   // (the first passes stand: the rest are left out, and said)
+                logf("vk: DLSS 5 neural rendering (NGX direct): pass %u of %u was refused (%#x: each pass holds the model "
+                     "again): %u pass(es) run", pass + 1, want.passes, (unsigned)res, pass);
+                break;
+            }
+            logf("vk: DLSS 5 neural rendering (NGX direct): CreateFeature(18) refused %ux%u, preset %u, quality %u (%#x)",
+                 w, h, want.preset, want.quality, (unsigned)res);
+            if (res == NVSDK_NGX_Result_FAIL_PlatformError)
+                logf("vk:   FAIL_PlatformError: usually a device made without the feature's extensions (the \"dlss-nr "
+                     "wants\" lines at start-up), or a model file this GPU cannot run");
+            explain(s, (unsigned)res, false, 0, 0);
+            refused(s, want, w, h);
+            return false;
+        }
+        s.feature[s.features++] = handle;
+    }
+    s.features_asked = want.passes;
     s.feature_w = w, s.feature_h = h;
     s.feature_preset = want.preset, s.feature_quality = want.quality;
     s.reset_next = true;
     s.why.clear();
-    logf("vk: DLSS 5 neural rendering (NGX direct): feature ready, %ux%u, preset %u, quality %u", w, h, want.preset,
-         want.quality);
+    logf("vk: DLSS 5 neural rendering (NGX direct): %u feature(s) ready (Passes %u), %ux%u, preset %u, quality %u",
+         s.features, want.passes, w, h, want.preset, want.quality);
     return true;
 }
 
@@ -495,7 +519,7 @@ VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, VkImag
         clear_scene(cmd, s);
         s.scene_cleared = true;
     }
-    if (!ensure_feature(s, cmd, want, sw, sh)) return VK_NULL_HANDLE;
+    if (!ensure_features(s, cmd, want, sw, sh)) return VK_NULL_HANDLE;
 
     // The window's image into ours, read in place (GENERAL is a layout a blit may read from): the game's is only read.
     barrier(cmd, src, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
@@ -517,61 +541,76 @@ VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, VkImag
 
     // The evaluation's parameters: openNR's set, by name (vk_dlssnr_ngx.h). The resources must outlive the call, which
     // these do; the UI pair is set to null rather than left from before, a parameter block being reused.
+    // One evaluation a pass (the Passes row; nr_plan.h): each with its own feature, reading the picture the pass before
+    // wrote, the two images in turn.
     NVSDK_NGX_Parameter* p = s.params;
-    NVSDK_NGX_Resource_VK color = ngx::resource(s.in.view, s.in.image, kColorFormat, sw, sh, false);
-    NVSDK_NGX_Resource_VK output = ngx::resource(s.out.view, s.out.image, kColorFormat, sw, sh, true);
+    Image* const pair[2] = {&s.in, &s.out};
     NVSDK_NGX_Resource_VK motion = ngx::resource(s.motion.view, s.motion.image, kMotionFormat, sw, sh, false);
     NVSDK_NGX_Resource_VK depth = ngx::resource(s.depth.view, s.depth.image, kDepthFormat, sw, sh, false);
-    set_sizes(p, sw, sh);
-    NVSDK_NGX_Parameter_SetVoidPointer(p, "DLSSNR.Color", &color);
-    NVSDK_NGX_Parameter_SetVoidPointer(p, "DLSSNR.Output", &output);
-    NVSDK_NGX_Parameter_SetVoidPointer(p, "DLSSNR.MVec", &motion);
-    NVSDK_NGX_Parameter_SetVoidPointer(p, "DLSSNR.Depth", &depth);
-    NVSDK_NGX_Parameter_SetVoidPointer(p, "DLSSNR.UI", nullptr);
-    NVSDK_NGX_Parameter_SetVoidPointer(p, "DLSSNR.UIAlpha", nullptr);
-    for (const char* which : {"Color", "Output", "MVec", "Depth"}) set_subrect(p, which, sw, sh);
-    // No camera: an identity one with no jitter and no motion is the honest description of a finished frame
-    // (vk_dlssnr.cpp scene_constants).
-    NVSDK_NGX_Parameter_SetF(p, NVSDK_NGX_Parameter_Jitter_Offset_X, 0.0f);
-    NVSDK_NGX_Parameter_SetF(p, NVSDK_NGX_Parameter_Jitter_Offset_Y, 0.0f);
-    NVSDK_NGX_Parameter_SetF(p, "DLSSNR.JitterOffsetX", 0.0f);
-    NVSDK_NGX_Parameter_SetF(p, "DLSSNR.JitterOffsetY", 0.0f);
-    NVSDK_NGX_Parameter_SetF(p, "DLSSNR.MVecScaleX", 1.0f);
-    NVSDK_NGX_Parameter_SetF(p, "DLSSNR.MVecScaleY", 1.0f);
-    NVSDK_NGX_Parameter_SetI(p, "DLSSNR.DepthInverted", 0);
-    NVSDK_NGX_Parameter_SetI(p, "DLSSNR.Enabled", 1);
-    NVSDK_NGX_Parameter_SetI(p, "DLSSNR.Reset", s.reset_next ? 1 : 0);
-    NVSDK_NGX_Parameter_SetF(p, "DLSSNR.Intensity", want.intensity);
-    NVSDK_NGX_Parameter_SetF(p, "DLSSNR.LocalToneStrength", want.local_tone);
-    NVSDK_NGX_Parameter_SetF(p, "DLSSNR.LocalStructureStrength", want.local_structure);
-    NVSDK_NGX_Parameter_SetF(p, "DLSSNR.GlobalToneStrength", want.global_tone);
-    NVSDK_NGX_Parameter_SetI(p, "DLSSNR.UseAutoMask", want.auto_mask ? 1 : 0);
-    NVSDK_NGX_Parameter_SetF(p, "DLSSNR.SkinStructureStrength", want.skin);
-    NVSDK_NGX_Parameter_SetUI(p, "DLSSNR.Style", want.style);
-    NVSDK_NGX_Parameter_SetI(p, "DLSSNR.UICorrection", 0);   // (no UI layer handed over: there is none to correct)
-    NVSDK_NGX_Parameter_SetI(p, "DLSS.Indicator.Invert.X.Axis", 0);
-    NVSDK_NGX_Parameter_SetI(p, "DLSS.Indicator.Invert.Y.Axis", 0);
-    const NVSDK_NGX_Result res = ngx::evaluate_feature(cmd, s.feature, p);
-    if (NVSDK_NGX_FAILED(res)) {
-        logf("vk: DLSS 5 neural rendering (NGX direct): the evaluation was refused (%#x); waiting for a setting to change",
-             (unsigned)res);
-        refused(s, want, sw, sh);
-        return VK_NULL_HANDLE;
+    for (unsigned pass = 0; pass < s.features; pass++) {
+        Image& from = *pair[nr_plan::reads((int)pass)];
+        Image& to = *pair[nr_plan::writes((int)pass)];
+        if (pass)   // (the pass before wrote `from`, and read `to`, which this one writes)
+            for (Image* i : pair)
+                barrier(cmd, i->image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                        VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_SHADER_READ_BIT,
+                        VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+        NVSDK_NGX_Resource_VK color = ngx::resource(from.view, from.image, kColorFormat, sw, sh, false);
+        NVSDK_NGX_Resource_VK output = ngx::resource(to.view, to.image, kColorFormat, sw, sh, true);
+        set_sizes(p, sw, sh);
+        NVSDK_NGX_Parameter_SetVoidPointer(p, "DLSSNR.Color", &color);
+        NVSDK_NGX_Parameter_SetVoidPointer(p, "DLSSNR.Output", &output);
+        NVSDK_NGX_Parameter_SetVoidPointer(p, "DLSSNR.MVec", &motion);
+        NVSDK_NGX_Parameter_SetVoidPointer(p, "DLSSNR.Depth", &depth);
+        NVSDK_NGX_Parameter_SetVoidPointer(p, "DLSSNR.UI", nullptr);
+        NVSDK_NGX_Parameter_SetVoidPointer(p, "DLSSNR.UIAlpha", nullptr);
+        for (const char* which : {"Color", "Output", "MVec", "Depth"}) set_subrect(p, which, sw, sh);
+        // No camera: an identity one with no jitter and no motion is the honest description of a finished frame
+        // (vk_dlssnr.cpp scene_constants).
+        NVSDK_NGX_Parameter_SetF(p, NVSDK_NGX_Parameter_Jitter_Offset_X, 0.0f);
+        NVSDK_NGX_Parameter_SetF(p, NVSDK_NGX_Parameter_Jitter_Offset_Y, 0.0f);
+        NVSDK_NGX_Parameter_SetF(p, "DLSSNR.JitterOffsetX", 0.0f);
+        NVSDK_NGX_Parameter_SetF(p, "DLSSNR.JitterOffsetY", 0.0f);
+        NVSDK_NGX_Parameter_SetF(p, "DLSSNR.MVecScaleX", 1.0f);
+        NVSDK_NGX_Parameter_SetF(p, "DLSSNR.MVecScaleY", 1.0f);
+        NVSDK_NGX_Parameter_SetI(p, "DLSSNR.DepthInverted", 0);
+        NVSDK_NGX_Parameter_SetI(p, "DLSSNR.Enabled", 1);
+        NVSDK_NGX_Parameter_SetI(p, "DLSSNR.Reset", s.reset_next ? 1 : 0);
+        NVSDK_NGX_Parameter_SetF(p, "DLSSNR.Intensity", want.intensity);
+        // (passes after the first are given no local tone: it would be applied again by each, nr_plan.h)
+        NVSDK_NGX_Parameter_SetF(p, "DLSSNR.LocalToneStrength", nr_plan::local_tone(want.local_tone, (int)pass));
+        NVSDK_NGX_Parameter_SetF(p, "DLSSNR.LocalStructureStrength", want.local_structure);
+        NVSDK_NGX_Parameter_SetF(p, "DLSSNR.GlobalToneStrength", want.global_tone);
+        NVSDK_NGX_Parameter_SetI(p, "DLSSNR.UseAutoMask", want.auto_mask ? 1 : 0);
+        NVSDK_NGX_Parameter_SetF(p, "DLSSNR.SkinStructureStrength", want.skin);
+        NVSDK_NGX_Parameter_SetUI(p, "DLSSNR.Style", want.style);
+        NVSDK_NGX_Parameter_SetI(p, "DLSSNR.UICorrection", 0);   // (no UI layer handed over: there is none to correct)
+        NVSDK_NGX_Parameter_SetI(p, "DLSS.Indicator.Invert.X.Axis", 0);
+        NVSDK_NGX_Parameter_SetI(p, "DLSS.Indicator.Invert.Y.Axis", 0);
+        const NVSDK_NGX_Result res = ngx::evaluate_feature(cmd, s.feature[pass], p);
+        if (NVSDK_NGX_FAILED(res)) {
+            logf("vk: DLSS 5 neural rendering (NGX direct): pass %u's evaluation was refused (%#x); waiting for a setting "
+                 "to change", pass + 1, (unsigned)res);
+            refused(s, want, sw, sh);
+            return VK_NULL_HANDLE;
+        }
     }
     s.reset_next = false;
     if (!s.told_running) {
         s.told_running = true;
-        logf("vk: DLSS 5 neural rendering (NGX direct) runs over %ux%u frames", sw, sh);
+        logf("vk: DLSS 5 neural rendering (NGX direct) runs over %ux%u frames, %u pass(es) a frame", sw, sh, s.features);
     }
-    barrier(cmd, s.out.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_2_SHADER_WRITE_BIT,
+    // The last pass's picture: the caller presents it instead of the game's image.
+    Image& result = *pair[nr_plan::result((int)s.features)];
+    barrier(cmd, result.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_2_SHADER_WRITE_BIT,
             VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT);
-    if (out_view) *out_view = s.out.view;
-    return s.out.image;
+    if (out_view) *out_view = result.view;
+    return result.image;
 }
 
 void shutdown() {
     State& s = state();
-    release_feature(s);
+    release_features(s);
     ngx::destroy_params(s.params);
     s.params = nullptr;
     if (s.in.image || s.out.image) idle();
@@ -629,7 +668,8 @@ int running_backend() {
     return dlssnr_ngx::built_with_sdk() ? NGX : STREAMLINE;
 }
 
-VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, VkImageView* out_view) {
+VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView* out_view,
+              uint32_t* out_w, uint32_t* out_h) {
     static int told = -1;
     const int b = running_backend();
     if (b != told && nr_settings().on) {
@@ -638,8 +678,32 @@ VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, VkImag
              b == NGX ? "NGX directly" : b == OPEN ? "OpenDLSS-NR" : "Streamline",
              asked_backend() == AUTO ? "Auto" : b == NGX ? "NGX direct" : b == OPEN ? "Open" : "Streamline");
     }
-    if (b == OPEN) return opennr::apply(cmd, src, sw, sh, out_view);
-    return b == NGX ? dlssnr_ngx::apply(cmd, src, sw, sh, out_view) : dlssnr::apply(cmd, src, sw, sh, out_view);
+    const auto backend = [b, cmd](VkImage from, uint32_t w, uint32_t h, VkImageView* view) {
+        if (b == OPEN) return opennr::apply(cmd, from, w, h, view);
+        return b == NGX ? dlssnr_ngx::apply(cmd, from, w, h, view) : dlssnr::apply(cmd, from, w, h, view);
+    };
+    if (!wanted()) return VK_NULL_HANDLE;
+    // The picture is a part of the window's image (the crop: 2048x1152 of 2560x1440 at the default output resolution),
+    // and the model is given that part alone: vk_nr_scale.h says what running it over all of it cost.
+    const PresentSourceRect picture = present_source_rect(sw, sh, crop);
+    if (!picture.w || !picture.h) return VK_NULL_HANDLE;
+    *out_w = picture.w, *out_h = picture.h;
+    // The Resolution scale row (nr_plan.h): under 100% the backend is handed a smaller copy of the picture, and its
+    // detail is put back on the picture at full size. Read each frame, as every row of the tab is.
+    const int percent = opts.nr_scale;
+    const bool whole = !picture.x && !picture.y && picture.w == sw && picture.h == sh;
+    if (whole && !nr_plan::scaled(percent)) return backend(src, sw, sh, out_view);
+    uint32_t lw = 0, lh = 0;
+    const VkImage copy = nr_scale::take(cmd, src, picture.x, picture.y, picture.w, picture.h, percent, &lw, &lh);
+    if (!copy) return VK_NULL_HANDLE;
+    VkImageView model_view = VK_NULL_HANDLE;
+    const VkImage model = backend(copy, lw, lh, &model_view);
+    if (!model || !model_view) return VK_NULL_HANDLE;
+    if (lw == picture.w && lh == picture.h) {   // (at full size: the model's picture is the one to show)
+        *out_view = model_view;
+        return model;
+    }
+    return nr_scale::restore(cmd, model_view, out_view);
 }
 
 const char* why() {

@@ -20,8 +20,10 @@
 #include <sl_core_api.h>
 #include <sl_dlss.h>
 
+#include "nr_plan.h"   // (the Passes row: one viewport a pass)
 #include "vk_dlssnr_options.h"
 #include "vk_streamline_api.h"
+#include "vk_work.h"   // (after the others: its commands through the recorder, counted as work for full_barrier)
 
 namespace mkwvk::dlssnr {
 namespace {
@@ -61,6 +63,7 @@ struct State {
     uint32_t width{}, height{};
     bool scene_cleared{};
     uint32_t frame{};
+    unsigned viewports{};   // (the most passes run so far: one Streamline viewport each, kViewport + pass)
     std::mutex mu;   // (Streamline's calls for one viewport are not thread-safe among themselves)
 };
 
@@ -304,79 +307,98 @@ VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh,
     barrier(cmd, s.out.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
             VK_ACCESS_2_SHADER_WRITE_BIT);
 
-    const sl::ViewportHandle viewport{kViewport};
+    // One evaluation a pass (the Passes row; nr_plan.h), each on a viewport of its own: Streamline keeps a feature's
+    // history by viewport, and a pass handed the pass before's picture as its "next frame" would have none worth the
+    // name. The passes read and write the pair of images in turn; with one pass this is the single evaluation it was.
     sl::Result result = sl::Result::eOk;
     const char* stage = "slDLSSNRSetOptions";
+    Image* const pair[2] = {&s.in, &s.out};
     {
         std::lock_guard lk(s.mu);
-        if (options_changed) {
-            DlssNrOptions o;
-            o.mode = DlssNrMode::eOn;
-            o.intensity = want.intensity;
-            o.localToneStrength = want.local_tone;
-            o.localStructureStrength = want.local_structure;
-            o.globalToneStrength = want.global_tone;
-            o.style = want.style;
-            o.preset = want.preset;
-            o.useAutoMask = want.auto_mask ? 1u : 0u;
-            o.skinStructureStrength = want.skin;
-            o.performanceMode = want.quality;
-            result = s.set_options(viewport, o);
-        }
         sl::FrameToken* token{};
         const uint32_t index = s.frame++;
-        if (result == sl::Result::eOk) {
-            stage = "slGetNewFrameToken";
-            result = streamline::api().get_new_frame_token(token, &index);
+        for (unsigned pass = 0; pass < want.passes && result == sl::Result::eOk; pass++) {
+            const sl::ViewportHandle viewport{kViewport + pass};
+            Image& from = *pair[nr_plan::reads((int)pass)];
+            Image& to = *pair[nr_plan::writes((int)pass)];
+            if (pass) {   // (the pass before wrote `from` in GENERAL and read `to`: the other way round now)
+                barrier(cmd, from.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_ACCESS_2_SHADER_WRITE_BIT, VK_ACCESS_2_SHADER_READ_BIT);
+                barrier(cmd, to.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                        VK_ACCESS_2_SHADER_READ_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
+            }
+            stage = "slDLSSNRSetOptions";
+            if (options_changed) {
+                DlssNrOptions o;
+                o.mode = DlssNrMode::eOn;
+                o.intensity = want.intensity;
+                // (passes after the first are given no local tone: it would be applied again by each, nr_plan.h)
+                o.localToneStrength = nr_plan::local_tone(want.local_tone, (int)pass);
+                o.localStructureStrength = want.local_structure;
+                o.globalToneStrength = want.global_tone;
+                o.style = want.style;
+                o.preset = want.preset;
+                o.useAutoMask = want.auto_mask ? 1u : 0u;
+                o.skinStructureStrength = want.skin;
+                o.performanceMode = want.quality;
+                result = s.set_options(viewport, o);
+            }
+            if (result == sl::Result::eOk && !token) {   // (one token a frame, whatever the passes)
+                stage = "slGetNewFrameToken";
+                result = streamline::api().get_new_frame_token(token, &index);
+            }
+            if (result == sl::Result::eOk) {
+                stage = "slSetConstants";
+                result = streamline::api().set_constants(scene_constants(sw, sh, recreated), *token, viewport);
+            }
+            // The usage each resource is *presented to Streamline as*, which is what Dagor's shipping
+            // integration passes: what the model reads is sampled, what it writes is a storage image.
+            // Handing it the images' whole usage mask instead told it the input was writable too.
+            sl::Resource color_in = resource(from, kColorFormat, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sw, sh,
+                                             VK_IMAGE_USAGE_SAMPLED_BIT);
+            sl::Resource color_out = resource(to, kColorFormat, VK_IMAGE_LAYOUT_GENERAL, sw, sh,
+                                              VK_IMAGE_USAGE_STORAGE_BIT);
+            sl::Resource depth = resource(s.depth, kDepthFormat, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sw, sh,
+                                          VK_IMAGE_USAGE_SAMPLED_BIT);
+            sl::Resource motion = resource(s.motion, kMotionFormat, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sw, sh,
+                                           VK_IMAGE_USAGE_SAMPLED_BIT);
+            // The uplift colour pair is tagged as a whole resource, with no extent, and depth and
+            // motion with one. That asymmetry is how the shipping integration does it: the colour
+            // buffers are the full frame by definition, and an extent on them is one more thing that
+            // can disagree with the resource it describes. Ours are exactly sw x sh either way, so this
+            // is fidelity to a measured integration rather than a fix for a bug we have seen.
+            const sl::Extent area{0, 0, sw, sh};
+            const sl::ResourceTag tags[] = {
+                sl::ResourceTag{&color_in, sl::kBufferTypeUpliftInputColor,
+                                sl::ResourceLifecycle::eValidUntilEvaluate, nullptr},
+                sl::ResourceTag{&color_out, sl::kBufferTypeUpliftOutputColor,
+                                sl::ResourceLifecycle::eValidUntilEvaluate, nullptr},
+                sl::ResourceTag{&depth, sl::kBufferTypeDepth,
+                                sl::ResourceLifecycle::eValidUntilEvaluate, &area},
+                sl::ResourceTag{&motion, sl::kBufferTypeMotionVectors,
+                                sl::ResourceLifecycle::eValidUntilEvaluate, &area},
+            };
+            const auto command_buffer = reinterpret_cast<sl::CommandBuffer*>(cmd);
+            if (result == sl::Result::eOk) {
+                stage = "slSetTagForFrame";
+                // (Streamline records into cmd itself, which vk_work.h does not see: what this thread recorded through it
+                // reaches cmd first, and Streamline's commands count as work for the barrier after them)
+                ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);
+                result = streamline::api().set_tag_for_frame(*token, viewport, tags, 4, command_buffer);
+                note_work();
+            }
+            if (result == sl::Result::eOk) {
+                stage = "slEvaluateFeature";
+                const sl::BaseStructure* inputs[] = {&viewport};
+                ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);
+                result = streamline::api().evaluate_feature(sl::kFeatureDLSS_NR, *token, inputs, 1,
+                                                            command_buffer);
+                note_work();
+                // Out of VRAM is the model saying it had to work small, not that it failed.
+                if (result == sl::Result::eWarnOutOfVRAM) result = sl::Result::eOk;
+            }
         }
-        if (result == sl::Result::eOk) {
-            stage = "slSetConstants";
-            result = streamline::api().set_constants(scene_constants(sw, sh, recreated), *token,
-                                                    viewport);
-        }
-        // The usage each resource is *presented to Streamline as*, which is what Dagor's shipping
-        // integration passes: what the model reads is sampled, what it writes is a storage image.
-        // Handing it the images' whole usage mask instead told it the input was writable too.
-        sl::Resource color_in = resource(s.in, kColorFormat,
-                                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sw, sh,
-                                         VK_IMAGE_USAGE_SAMPLED_BIT);
-        sl::Resource color_out = resource(s.out, kColorFormat, VK_IMAGE_LAYOUT_GENERAL, sw, sh,
-                                          VK_IMAGE_USAGE_STORAGE_BIT);
-        sl::Resource depth = resource(s.depth, kDepthFormat,
-                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sw, sh,
-                                      VK_IMAGE_USAGE_SAMPLED_BIT);
-        sl::Resource motion = resource(s.motion, kMotionFormat,
-                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sw, sh,
-                                       VK_IMAGE_USAGE_SAMPLED_BIT);
-        // The uplift colour pair is tagged as a whole resource, with no extent, and depth and
-        // motion with one. That asymmetry is how the shipping integration does it: the colour
-        // buffers are the full frame by definition, and an extent on them is one more thing that
-        // can disagree with the resource it describes. Ours are exactly sw x sh either way, so this
-        // is fidelity to a measured integration rather than a fix for a bug we have seen.
-        const sl::Extent area{0, 0, sw, sh};
-        const sl::ResourceTag tags[] = {
-            sl::ResourceTag{&color_in, sl::kBufferTypeUpliftInputColor,
-                            sl::ResourceLifecycle::eValidUntilEvaluate, nullptr},
-            sl::ResourceTag{&color_out, sl::kBufferTypeUpliftOutputColor,
-                            sl::ResourceLifecycle::eValidUntilEvaluate, nullptr},
-            sl::ResourceTag{&depth, sl::kBufferTypeDepth,
-                            sl::ResourceLifecycle::eValidUntilEvaluate, &area},
-            sl::ResourceTag{&motion, sl::kBufferTypeMotionVectors,
-                            sl::ResourceLifecycle::eValidUntilEvaluate, &area},
-        };
-        const auto command_buffer = reinterpret_cast<sl::CommandBuffer*>(cmd);
-        if (result == sl::Result::eOk) {
-            stage = "slSetTagForFrame";
-            result = streamline::api().set_tag_for_frame(*token, viewport, tags, 4, command_buffer);
-        }
-        if (result == sl::Result::eOk) {
-            stage = "slEvaluateFeature";
-            const sl::BaseStructure* inputs[] = {&viewport};
-            result = streamline::api().evaluate_feature(sl::kFeatureDLSS_NR, *token, inputs, 1,
-                                                        command_buffer);
-            // Out of VRAM is the model saying it had to work small, not that it failed.
-            if (result == sl::Result::eWarnOutOfVRAM) result = sl::Result::eOk;
-        }
+        if (want.passes > s.viewports) s.viewports = want.passes;   // (shutdown frees each one's resources)
     }
     if (result != sl::Result::eOk) {
         const bool only_options = strcmp(stage, "slDLSSNRSetOptions") == 0;
@@ -395,12 +417,13 @@ VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh,
         else s.failed.store(true, std::memory_order_relaxed);
         return VK_NULL_HANDLE;
     }
-    // The model wrote s.out. The caller presents it instead of the game's image.
-    barrier(cmd, s.out.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+    // The last pass wrote its image of the pair (with one pass, s.out). The caller presents it instead of the game's.
+    Image& picture = *pair[nr_plan::result((int)want.passes)];
+    barrier(cmd, picture.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
             VK_ACCESS_2_SHADER_WRITE_BIT,
             VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT);
-    if (out_view) *out_view = s.out.view;
-    return s.out.image;
+    if (out_view) *out_view = picture.view;
+    return picture.image;
 }
 
 void shutdown() {
@@ -411,7 +434,8 @@ void shutdown() {
         device_wait_idle_locked();
     }
     if (streamline::nr_available())
-        streamline::api().free_resources(sl::kFeatureDLSS_NR, sl::ViewportHandle{kViewport});
+        for (unsigned pass = 0; pass < (s.viewports ? s.viewports : 1u); pass++)
+            streamline::api().free_resources(sl::kFeatureDLSS_NR, sl::ViewportHandle{kViewport + pass});
     drop(s.in), drop(s.out), drop(s.depth), drop(s.motion);
     s.width = s.height = 0;
     s.scene_cleared = false;

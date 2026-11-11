@@ -213,23 +213,25 @@ def package(a):
         return 1
     # (hookshot) the renderer CI built with NVIDIA DLSS, DLSS 5 neural rendering and AMD FSR 4 in it, which nx2/make_game.py
     # uses on the player's PC instead of compiling one without those (prebuilt_renderer), and AMD's FSR runtime beside it
-    if a.vk:
-        copy(a.vk, os.path.join(tools, "prebuilt", "hookshot_vk.dll"))
-        print("prebuilt renderer: %s" % a.vk)
-    if a.amd_fsr:
+    # (the fork's options: a caller of package() without them, as tests/test_ship_state_list.py's, gets none of the three)
+    vk, amd_fsr, repository = getattr(a, "vk", None), getattr(a, "amd_fsr", None), getattr(a, "repository", None)
+    if vk:
+        copy(vk, os.path.join(tools, "prebuilt", "hookshot_vk.dll"))
+        print("prebuilt renderer: %s" % vk)
+    if amd_fsr:
         n = 0
-        for f in sorted(os.listdir(a.amd_fsr)):
+        for f in sorted(os.listdir(amd_fsr)):
             if f.lower().startswith("amd_fidelityfx_") and f.lower().endswith("_vk.dll"):
-                copy(os.path.join(a.amd_fsr, f), os.path.join(tools, "amd-fsr", f))
+                copy(os.path.join(amd_fsr, f), os.path.join(tools, "amd-fsr", f))
                 n += 1
-        if os.path.isfile(os.path.join(a.amd_fsr, "LICENSE.txt")):
-            copy(os.path.join(a.amd_fsr, "LICENSE.txt"), os.path.join(tools, "amd-fsr", "LICENSE.txt"))
-        print("AMD FSR runtime: %d DLLs from %s" % (n, a.amd_fsr))
+        if os.path.isfile(os.path.join(amd_fsr, "LICENSE.txt")):
+            copy(os.path.join(amd_fsr, "LICENSE.txt"), os.path.join(tools, "amd-fsr", "LICENSE.txt"))
+        print("AMD FSR runtime: %d DLLs from %s" % (n, amd_fsr))
     # (hookshot) the repository the release is from, for the Builder's updater and the game's update check (nx2/version.py)
-    if a.repository:
+    if repository:
         with open(os.path.join(tools, "repository.txt"), "w", encoding="utf-8", newline="\n") as f:
-            f.write(a.repository.strip() + "\n")
-        print("repository: %s" % a.repository.strip())
+            f.write(repository.strip() + "\n")
+        print("repository: %s" % repository.strip())
     print("package folder: %s" % out)
     return 0
 

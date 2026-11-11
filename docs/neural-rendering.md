@@ -23,18 +23,25 @@ denoiser, and it is why the feature can be put over rasterized content at all.
 
 ## Where it runs here
 
-In the present, over the frame the game finished, before the menu and the FPS counter are drawn on
-top (`gpu/vk/vk_replay.cpp`, `present_image`). It is not an upscaler and is not part of the
-upscaling path: input and output are both at display resolution, and `Upscaling` / `Frame
-generation` are untouched by it. It runs on every presented frame, so with frame generation at 4x it
-runs four times per game frame -- each shown frame gets enhanced, which is the point, but it is four
-times the cost.
+At the present, over the frame the game finished, before the menu and the FPS counter are drawn on
+top (`gpu/vk/vk_replay.cpp`, `do_present`: `nr::apply` in the recording after the present's own, as
+frame generation's is, so the model's GPU time does not hold the game's next frame back). It is not
+an upscaler and is not part of the upscaling path: input and output are both at the game's output
+size, and the Upscaler is untouched by it.
+
+It runs **once for each of the game's frames, before frame generation**: the made frames are made
+from the model's picture. It used to run in `present_image`, which the display thread calls for
+every frame it shows, so with frame generation at 4x the model ran four times a game frame, three of
+them over interpolated pictures and with a history fed frames that were never rendered. It is left
+out while the picture is the game's own HDR10 (the Insert menu's HDR at Native): that one is PQ codes
+in RGB10A2, and the model's working copy is eight-bit SDR. HDR's Expanded is made from the model's
+picture.
 
 The model is handed a flat depth and no motion at all, with an identity camera and no jitter
 (`scene_constants`). That is deliberate, not laziness: by this point in the frame the picture is
 already upscaled and already has the HUD on it, so the scene's real depth buffer does not describe
 the image being handed over. Giving it the real camera would have it reproject detail that is not
-where it thinks it is. The renderer *does* have real scene depth and camera motion (`vk_camera_motion.cpp`),
+where it thinks it is. The renderer *does* have real scene depth and camera motion (`vk_fsr3_inputs.cpp`),
 and feeding them is the obvious next experiment -- it would mean moving the pass before the HUD.
 
 Dagor's shipping integration also runs NR on a **tonemapped, display-referred SDR image** and
@@ -251,13 +258,15 @@ surround the network (`gpu/vk/shaders/opennr_pre.comp`, `opennr_post.comp`, foll
 - **out**: `clamp(proxy + rgb / 4)`, the temporal blend by the head's own logit times the model's
   `blend_scale`, the next history truncated to half, then the style operator and the intensity blend.
 
-**Temporal or single-frame: temporal**, with the scene's camera-only motion (`vk_camera_motion.h`) where there is a
-scene; `RX_VK_OPENNR_TEMPORAL=0` is single-frame (lanes 7-9 a copy of the frame, a fixed noise seed, no blend). The
-motion is the 3D scene's at its render size, so the HUD gets the scene's motion under it -- wrong for the HUD, and left
-to the network's per-pixel blend logit to reject, which is what upstream's demo leaves disocclusion to as well. A camera
-that did not move gets zero motion rather than a motion pass, because `camera_motion::record` answers a repeated matrix
-with the target it last wrote (a moving frame's). Made frames of frame generation go through it like any other. How
-well any of this looks is unmeasured (below).
+**Temporal or single-frame: temporal**, with the scene's camera motion where there is a scene
+(`vk_fsr3_inputs.cpp`'s frame, read with `fsr3_inputs::latest`: the one validated copy of the scene's depth and motion,
+kept while the temporal path asks for it, `opennr::scene_motion_wanted`); `RX_VK_OPENNR_TEMPORAL=0` is single-frame (lanes
+7-9 a copy of the frame, a fixed noise seed, no blend). The motion is the 3D scene's at its render size, so the HUD gets
+the scene's motion under it -- wrong for the HUD, and left to the network's per-pixel blend logit to reject, which is what
+upstream's demo leaves disocclusion to as well. A frame the scene calls a reset (a cut, a new size) has no motion and
+starts the history again, and the descriptor sets are written again whenever the motion's view is another one, so a set
+never names a view that has been retired. The network sees the game's own frames only: frame generation's made frames
+come after it. How well any of this looks is unmeasured (below).
 
 **The Neural tab's rows**, against what the network actually takes:
 
@@ -273,6 +282,33 @@ well any of this looks is unmeasured (below).
 | Global tone | **no counterpart**: the network has five conditioning scalars and this is not one (Streamline 2.14 ignores it too) |
 | Preset | **no counterpart**: there is one network, the model directory's; NVIDIA's presets pick among networks |
 | Model (Performance ... DLAA) | **no counterpart**: the network has no quality modes and always runs at the frame's size |
+| Passes | **no counterpart**: the open network runs one pass (NVIDIA's backends make a feature a pass, below) |
+| Resolution scale | the size of the picture the network is given (`vk_nr_scale.cpp`): the network is built again at that size |
+
+### Passes, Resolution scale, and the part of the frame the model is given
+
+Three things sit between the present and whichever backend runs, in `nr::apply` (`vk_dlssnr_ngx.cpp`):
+
+- **The picture's part of the frame.** The game presents a part of a larger window image (2048x1152 of 2560x1440 at
+  the default output resolution). The model used to be run over all of it: a third of its time on pixels nobody sees,
+  and with what lay outside the picture in what it takes the frame's tone from. It is given the crop alone now
+  (`vk_nr_scale.cpp take`), and its image is shown whole. Measured with the open network on an RTX 5060 Ti: 21.1 ms
+  a frame over 2560x1440 before, 13.4 ms over the 2048x1152 picture after.
+- **Resolution scale** (`nr_plan.h`, 50% to 100%; the RenoDX DLSS add-on's processing scale). Under 100% the model
+  is given a smaller copy of the picture, and `shaders/nr_detail.comp` adds its detail -- its picture less that copy,
+  both stretched back -- to the picture at full size. Where the model changed nothing the picture comes out as it
+  went in. Measured the same way: 13.4 ms at 100%, 4.2 ms at 50%; with the network's blend at 0% a capture through
+  the 50% path differs from an unprocessed one by no more than two unprocessed captures differ from each other (the
+  scene's own animation), and at 100% the model's change shows at both scales.
+- **Passes** (`nr_plan.h`, 1 to 10; the add-on's pass count). The model goes over the frame that many times, each
+  pass on the picture of the one before. Each pass is a feature of its own (NGX direct: one `CreateFeature` a pass;
+  Streamline: one viewport a pass), because the model keeps a history and one feature evaluated twice a frame would
+  be handed its own output as the next frame. The passes read and write a pair of images in turn, and passes after
+  the first are given no local tone, the convention of the multipass integrations this follows. A pass NGX cannot
+  make (each holds the model's memory again) is left out and the log says how many run. **Not run here**: NVIDIA's
+  model has no Linux runtime and Streamline is Windows-only, so the passes are checked by `tests/test_nr_plan.py`
+  (which image each pass reads and writes, the tone each is given, that the backends take both from `nr_plan.h`)
+  and by compiling both backends for Windows, not by a frame.
 
 ### What was measured, and what was not
 

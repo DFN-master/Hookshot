@@ -431,7 +431,7 @@ bool generate(VkCommandBuffer cmd, const FrameInputs& in) {
     prep.viewSpaceToMetersFactor = 1.0f;
     prep.depth = resource(in.depth, in.depth_format, in.render_width, in.render_height, false);
     prep.motionVectors = resource(in.motion, in.motion_format, in.render_width, in.render_height, false);
-    for (int c = 0; c < 3; c++) {   // (the camera in the world, forward the way it looks: dlssg_math.h)
+    for (int c = 0; c < 3; c++) {   // (the camera in the world, forward the way it looks: camera_vectors.h)
         prep.cameraRight[c] = in.camera_right[c];
         prep.cameraUp[c] = in.camera_up[c];
         prep.cameraForward[c] = in.camera_forward[c];
