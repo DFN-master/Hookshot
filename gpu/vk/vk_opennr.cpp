@@ -78,6 +78,7 @@ struct State {
     opennr_net::Network* net{};
     opennr_net::Built built{};
     uint32_t width{}, height{};
+    uint32_t refused_w{}, refused_h{};   // (the frame size the last resize failed for, 0: none)
     // the frame's own resources
     Image in{}, out{}, history[2]{}, no_motion{};
     bool fresh{};   // (just made: their first transition and clear go in this frame's command buffer)
@@ -101,7 +102,9 @@ struct State {
 };
 
 State& state() {
-    static State s;
+    // (never destroyed: at exit a static State's destructor would meet the checker's thread still joinable, which is
+    // std::terminate; as vk_temporal.cpp's and vk_fsr4.cpp's states)
+    static State& s = *new State;
     return s;
 }
 
@@ -416,7 +419,10 @@ bool resize(State& s, uint32_t w, uint32_t h) {
         set_why(s, "Not available at this window size (the log says why).");
         return false;
     }
-    if (!make_images(s, w, h)) return false;
+    if (!make_images(s, w, h)) {
+        set_why(s, "Not available at this window size (the log says why).");
+        return false;
+    }
     write_sets(s, VK_NULL_HANDLE);
     s.width = w, s.height = h, s.history_valid = false;
     logf("vk: open NR: now %ux%u frames (field %ux%u)", w, h, s.built.full_width, s.built.full_height);
@@ -627,6 +633,8 @@ const char* why() {
     return state().why;
 }
 
+void history_gap() { state().history_valid = false; }
+
 VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, VkImageView* out_view) {
     State& s = state();
     if (!src || !sw || !sh || !s.device_ok) return VK_NULL_HANDLE;
@@ -685,9 +693,18 @@ VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, VkImag
         opennr_net::fall_back_to_barriers(s.net);
         s.width = s.height = 0;   // (the size check below builds it again)
     }
-    if ((sw != s.width || sh != s.height) && !resize(s, sw, sh)) {
-        s.phase = kFailed;
-        return VK_NULL_HANDLE;
+    if (sw != s.width || sh != s.height) {
+        // (a size it could not be made for, short of video memory at a large one: refused while the size stays, and
+        // asked again at another, a lower Resolution scale or a smaller window. Not off for the run: its hint says "at
+        // this window size")
+        if (sw == s.refused_w && sh == s.refused_h) return VK_NULL_HANDLE;
+        if (!resize(s, sw, sh)) {
+            s.width = s.height = 0;
+            s.refused_w = sw, s.refused_h = sh;
+            return VK_NULL_HANDLE;
+        }
+        s.refused_w = s.refused_h = 0;
+        set_why(s, "");
     }
 
     // ---- the motion, for the temporal path: the scene's own, as the frame generation methods take it

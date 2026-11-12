@@ -25,14 +25,41 @@
 namespace mkwvk::opennr_net {
 namespace {
 
-bool read_file(const std::string& path, std::vector<uint8_t>& out) {
+/// A file's bytes, when it is `most` bytes or fewer: the size is asked before anything is allocated (the folder is the
+/// player's, and a file of any size can be there). *size gets the file's own size either way
+bool read_file(const std::string& path, std::vector<uint8_t>& out, uint64_t most, uint64_t* size = nullptr) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) return false;
-    const std::streamsize n = f.tellg();
+    const std::streamoff n = f.tellg();
+    if (size) *size = n < 0 ? 0 : (uint64_t)n;
+    if (n < 0 || (uint64_t)n > most) return false;
     f.seekg(0);
     out.resize((size_t)n);
-    return (bool)f.read(reinterpret_cast<char*>(out.data()), n);
+    return n == 0 || (bool)f.read(reinterpret_cast<char*>(out.data()), n);
 }
+
+/// How deep a JSON text's arrays and objects nest (strings skipped): json.h's parser recurses once for each level, with
+/// no limit of its own, and a manifest of nothing but '[' would run the checker's thread out of stack
+size_t json_depth(const std::vector<uint8_t>& text) {
+    size_t depth = 0, deepest = 0;
+    bool in_string = false;
+    for (size_t i = 0; i < text.size(); i++) {
+        const uint8_t c = text[i];
+        if (in_string) {
+            if (c == '\\') i++;
+            else if (c == '"') in_string = false;
+        } else if (c == '"') {
+            in_string = true;
+        } else if (c == '[' || c == '{') {
+            if (++depth > deepest) deepest = depth;
+        } else if ((c == ']' || c == '}') && depth) {
+            depth--;
+        }
+    }
+    return deepest;
+}
+constexpr uint64_t kManifestMost = 16ull << 20;   // (a real one is a few hundred KiB)
+constexpr size_t kManifestDepth = 64;             // (a real one nests 4 deep)
 
 void set_env(const char* name, const char* value) {
 #ifdef _WIN32
@@ -48,8 +75,14 @@ ModelCheck check_model(const std::string& dir) {
     ModelCheck c;
     try {
         std::vector<uint8_t> text;
-        if (!read_file(dir + "/manifest.json", text)) {
-            c.why = "no manifest.json in " + dir;
+        uint64_t manifest_size = 0;
+        if (!read_file(dir + "/manifest.json", text, kManifestMost, &manifest_size)) {
+            c.why = manifest_size > kManifestMost ? "manifest.json is " + std::to_string(manifest_size) + " bytes: not a model's manifest"
+                                                  : "no manifest.json in " + dir;
+            return c;
+        }
+        if (json_depth(text) > kManifestDepth) {
+            c.why = "manifest.json nests too deep to be a model's manifest";
             return c;
         }
         const json::Value m = json::parse(std::string(text.begin(), text.end()));
@@ -70,13 +103,15 @@ ModelCheck check_model(const std::string& dir) {
         for (const json::Value& s : m["stages"].array) {
             std::vector<uint8_t> bytes;
             const std::string path = dir + "/model/" + s["file"].str();
-            if (!read_file(path, bytes)) {
-                c.why = "cannot read the stage file " + path;
-                return c;
-            }
-            if (bytes.size() != (size_t)s["packedByteLength"].integer()) {
-                c.why = "stage " + s["id"].str() + " is " + std::to_string(bytes.size()) + " bytes, the manifest says " +
-                        std::to_string(s["packedByteLength"].integer());
+            // (its length as the manifest gives it is the most that is read: a file of another size is refused before a
+            // byte of it is allocated)
+            const int64_t packed = s["packedByteLength"].integer();
+            uint64_t on_disk = 0;
+            if (packed < 0 || !read_file(path, bytes, (uint64_t)packed, &on_disk) || bytes.size() != (uint64_t)packed) {
+                c.why = on_disk && on_disk != (uint64_t)packed
+                            ? "stage " + s["id"].str() + " is " + std::to_string(on_disk) + " bytes, the manifest says " +
+                                  std::to_string(packed)
+                            : "cannot read the stage file " + path;
                 return c;
             }
             std::string want = s["sha256"].str();
@@ -97,7 +132,8 @@ ModelCheck check_model(const std::string& dir) {
                 c.why = "tensor " + t["name"].str() + " is in a stage the manifest does not list";
                 return c;
             }
-            if ((uint64_t)t["stageOffset"].integer() + (uint64_t)t["byteLength"].integer() > stage->second) {
+            const int64_t offset = t["stageOffset"].integer(), length = t["byteLength"].integer();
+            if (offset < 0 || length < 0 || (uint64_t)offset > stage->second || (uint64_t)length > stage->second - (uint64_t)offset) {
                 c.why = "tensor " + t["name"].str() + " runs past the end of its stage";
                 return c;
             }

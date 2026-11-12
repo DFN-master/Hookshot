@@ -60,7 +60,7 @@ def main():
     if len(nr_apply) != 1:
         fail("vk_dlssnr_ngx.cpp: nr::apply not found")
     # (through the one lambda that calls whichever backend runs, on the frame or on the Resolution scale's smaller copy)
-    if "if (b == OPEN) return opennr::apply(cmd, from, w, h, view);" not in nr_apply[0][1]:
+    if "b == OPEN  ? opennr::apply(cmd, from, w, h, view)" not in nr_apply[0][1]:
         fail("nr::apply does not hand the frame to the open backend when it is the one running")
     if "opennr::ready()" not in ngx:
         fail("the Backend row's Auto never falls to the open backend (nr::running_backend)")

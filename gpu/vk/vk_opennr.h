@@ -53,6 +53,8 @@ void device_created();
 /// image, GENERAL, the same size, with its view in `out_view`; VK_NULL_HANDLE when the network did not run, and the
 /// caller then presents `src` exactly as it would have.
 [[nodiscard]] VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, VkImageView* out_view);
+/// The model did not run at the frame before (nr::apply): the next frame is not blended with the history kept
+void history_gap();
 
 /// Releases everything. Before the device goes.
 void shutdown();

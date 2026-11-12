@@ -23,6 +23,7 @@ struct State {
     // (the picture at full size; under 100%, the model's smaller copy and the picture with its detail)
     Image frame{}, small{}, result{};
     uint32_t w{}, h{}, lw{}, lh{};   // (lw x lh: the copy's size, w x h when there is none)
+    uint32_t bad[4]{};               // (the sizes the images were last refused for, 0: none)
     VkDescriptorSetLayout set_layout{};
     VkPipelineLayout layout{};
     VkPipeline pipeline{};
@@ -172,6 +173,8 @@ void write_set(State& s, VkImageView model) {
 /// made again when either changes (the device idle first: the ones before may be in a frame not shown yet)
 bool resize(State& s, uint32_t w, uint32_t h, uint32_t lw, uint32_t lh) {
     if (s.frame.image && s.w == w && s.h == h && s.lw == lw && s.lh == lh) return true;
+    // (sizes they could not be made for: not asked again, with the device idled and a log line, at every present)
+    if (s.bad[0] == w && s.bad[1] == h && s.bad[2] == lw && s.bad[3] == lh) return false;
     idle();
     constexpr VkImageUsageFlags read = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                        VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -182,10 +185,12 @@ bool resize(State& s, uint32_t w, uint32_t h, uint32_t lw, uint32_t lh) {
                                                   !make(s.result, w, h, read | VK_IMAGE_USAGE_STORAGE_BIT)))) {
         drop(s.frame), drop(s.small), drop(s.result);
         s.w = s.h = s.lw = s.lh = 0;
+        s.bad[0] = w, s.bad[1] = h, s.bad[2] = lw, s.bad[3] = lh;
         logf("vk: neural rendering: the picture's copies were not made (%ux%u, %ux%u): no model this frame", w, h, lw, lh);
         return false;
     }
     s.w = w, s.h = h, s.lw = lw, s.lh = lh;
+    s.bad[0] = s.bad[1] = s.bad[2] = s.bad[3] = 0;
     s.bound_model = VK_NULL_HANDLE;   // (the set names images that are gone)
     return true;
 }

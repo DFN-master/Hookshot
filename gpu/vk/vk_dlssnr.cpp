@@ -61,6 +61,7 @@ struct State {
     PFun_slDLSSNRSetOptions* set_options{};
     Image in{}, out{}, depth{}, motion{};
     uint32_t width{}, height{};
+    std::atomic<bool> history_gap{};   // (the next frame's constants say reset)
     bool scene_cleared{};
     uint32_t frame{};
     unsigned viewports{};   // (the most passes run so far: one Streamline viewport each, kViewport + pass)
@@ -259,6 +260,8 @@ bool asked() {
     return nr_settings().on;
 }
 
+void history_gap() { state().history_gap.store(true, std::memory_order_relaxed); }
+
 VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh,
               VkImageView* out_view) {
     State& s = state();
@@ -280,6 +283,7 @@ VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh,
         s.failed.store(true, std::memory_order_relaxed);
         return VK_NULL_HANDLE;
     }
+    const bool gap = s.history_gap.exchange(false);   // (nr::apply: the model did not run at the frame before)
     const bool options_changed = recreated || !s.have_applied || !(s.applied == want);
     s.applied = want;
     s.have_applied = true;
@@ -349,7 +353,7 @@ VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh,
             }
             if (result == sl::Result::eOk) {
                 stage = "slSetConstants";
-                result = streamline::api().set_constants(scene_constants(sw, sh, recreated), *token, viewport);
+                result = streamline::api().set_constants(scene_constants(sw, sh, recreated || gap), *token, viewport);
             }
             // The usage each resource is *presented to Streamline as*, which is what Dagor's shipping
             // integration passes: what the model reads is sampled, what it writes is a storage image.
@@ -451,6 +455,7 @@ bool built_with_sdk() { return false; }
 bool capable() { return false; }
 bool asked() { return false; }
 VkImage apply(VkCommandBuffer, VkImage, uint32_t, uint32_t, VkImageView*) { return VK_NULL_HANDLE; }
+void history_gap() {}
 void shutdown() {}
 
 } // namespace mkwvk::dlssnr

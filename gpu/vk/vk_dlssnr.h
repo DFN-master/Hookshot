@@ -51,6 +51,9 @@ namespace mkwvk::dlssnr {
 [[nodiscard]] VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh,
                             VkImageView* out_view);
 
+/// The model did not run at the frame before (nr::apply): the next frame's constants say reset
+void history_gap();
+
 /// Releases the feature's resources. Before the device goes.
 void shutdown();
 

@@ -46,6 +46,8 @@ size_t device_extensions(VkInstance instance, VkPhysicalDevice gpu, const char**
 /// (GENERAL, the same size, this path's own) with its view in `out_view`; VK_NULL_HANDLE when the model did not run, and
 /// the caller presents `src` as it would have.
 [[nodiscard]] VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, VkImageView* out_view);
+/// The model did not run at the frame before (nr::apply): the next evaluation is told to start its history again
+void history_gap();
 
 /// Releases the feature and its images. Before the device goes.
 void shutdown();

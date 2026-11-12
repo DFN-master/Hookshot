@@ -16,6 +16,7 @@
 #include "vk_nr_scale.h"   // (the picture's part of the frame, and the Resolution scale: whichever backend runs)
 #include "vk_present_rect.h"
 #include "vk_streamline.h"
+#include "vk_texture.h"   // (texture_frame_no: whether the model ran at the frame before)
 
 #if defined(HOOKSHOT_NGX)
 #include "vk_dlss.h"   // (dlss_ngx_session, dlss_ngx_runtime: the one NGX session and the folders it was given)
@@ -504,6 +505,8 @@ size_t device_extensions(VkInstance instance, VkPhysicalDevice gpu, const char**
     return ngx::device_extensions(instance, gpu, kFeature, out, max);
 }
 
+void history_gap() { state().reset_next = true; }
+
 VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, VkImageView* out_view) {
     State& s = state();
     if (!src || !sw || !sh || !asked()) return VK_NULL_HANDLE;
@@ -629,6 +632,7 @@ VkImage apply(VkCommandBuffer, VkImage, uint32_t, uint32_t, VkImageView*) {
     (void)asked;
     return VK_NULL_HANDLE;
 }
+void history_gap() {}
 void shutdown() {}
 
 #endif
@@ -678,9 +682,19 @@ VkImage apply(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, const 
              b == NGX ? "NGX directly" : b == OPEN ? "OpenDLSS-NR" : "Streamline",
              asked_backend() == AUTO ? "Auto" : b == NGX ? "NGX direct" : b == OPEN ? "Open" : "Streamline");
     }
-    const auto backend = [b, cmd](VkImage from, uint32_t w, uint32_t h, VkImageView* view) {
-        if (b == OPEN) return opennr::apply(cmd, from, w, h, view);
-        return b == NGX ? dlssnr_ngx::apply(cmd, from, w, h, view) : dlssnr::apply(cmd, from, w, h, view);
+    // (the model's own history is the frame before's only when it ran then: after the row was off, a stretch of Native
+    // HDR, another backend or a refusal held, what it kept is a picture from before, and the first frame back would blend
+    // with it or reproject from it. Each backend starts its history again; two frames' slack, as the upscale chain's)
+    static uint64_t ran_at = 0;
+    static int ran_backend = -1;
+    const uint64_t now = texture_frame_no();
+    if (ran_backend != b || now - ran_at > 2) opennr::history_gap(), dlssnr_ngx::history_gap(), dlssnr::history_gap();
+    const auto backend = [b, cmd, now](VkImage from, uint32_t w, uint32_t h, VkImageView* view) {
+        const VkImage made = b == OPEN  ? opennr::apply(cmd, from, w, h, view)
+                             : b == NGX ? dlssnr_ngx::apply(cmd, from, w, h, view)
+                                        : dlssnr::apply(cmd, from, w, h, view);
+        if (made) ran_at = now, ran_backend = b;
+        return made;
     };
     if (!wanted()) return VK_NULL_HANDLE;
     // The picture is a part of the window's image (the crop: 2048x1152 of 2560x1440 at the default output resolution),
