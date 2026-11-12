@@ -105,16 +105,17 @@ builds with `scripts/ngx_sdk.py` (it prints NVIDIA's license notice and needs `-
 then build with `HOOKSHOT_NGX_SDK=<sdk folder>`:
 
 ```powershell
-python -I scripts/ngx_sdk.py --platform windows C:\path\ngx-sdk     # headers, nvsdk_ngx_s.lib, nvngx_dlss.dll
+python -I scripts/ngx_sdk.py --platform windows C:\path\ngx-sdk     # headers, nvsdk_ngx_s.lib, nvngx_dlss(g).dll
 $env:HOOKSHOT_NGX_SDK = "C:\path\ngx-sdk"
 python -I nx2/make_game.py --nup "C:\path\your-game.nup" --out "C:\Games\Hookshot-dlss"
 ```
 
 On Windows the llvm-mingw build links NVIDIA's static `nvsdk_ngx_s.lib` (built for Microsoft's static runtime) into
 `hookshot_vk.dll`, with `gpu/vk/vk_ngx_msvc_rt.cpp` and `host/mingw_msvc_shims.c` for what it needs of that runtime.
-`make_game.py` copies `nvngx_dlss.dll` into the game folder's `ngx` folder; never put NGX's core, `_nvngx.dll`, beside
-the game (it is the driver's). On Linux it is `--platform linux` (or `scripts/linux/ngx-sdk.sh`), with `libnvsdk_ngx.a`
-and `libnvidia-ngx-dlss.so`. A Windows game with DLSS can be built on Linux too, with `RX_TARGET=windows` as below.
+`make_game.py` copies `nvngx_dlss.dll` and DLSS Frame Generation's `nvngx_dlssg.dll` into the game folder's `ngx`
+folder; never put NGX's core, `_nvngx.dll`, beside the game (it is the driver's). On Linux it is `--platform linux` (or
+`scripts/linux/ngx-sdk.sh`), with `libnvsdk_ngx.a`, `libnvidia-ngx-dlss.so` and `libnvidia-ngx-dlssg.so`. A Windows
+game with DLSS can be built on Linux too, with `RX_TARGET=windows` as below.
 CI's `vulkan-dlss` workflow (`.github/workflows/vulkan-dlss.yml`) checks only that `hookshot_vk.dll` still links with the
 SDK. It runs by hand, and on a push or pull request only when a file DLSS's build depends on changes; it accepts NVIDIA's
 license for that run alone and uploads nothing.
@@ -162,6 +163,9 @@ compilers that always run (up to 4 on Windows) still run under a smaller number.
 
 Use a separate `--work` folder or `OOT_WORK` if you keep more than one dump around. The lifted C and every build are
 local artifacts; they are never committed.
+
+Not measuring speed? [A faster build for development](docs/development.md#a-faster-build-for-development) compiles the
+hot code at `-O1`, about a quarter less compile time. Never use it for fps, timings or a release.
 
 ## Testing
 
@@ -312,9 +316,8 @@ NVIDIA's DLSS SDK is not one of them: it is never in the repository, and nothing
 ## Where to talk
 
 - **Issues:** [use the forms](https://github.com/NotRexed/Hookshot/issues/new/choose).
-- **Discord:** https://discord.gg/EajnD2AJD9. Use the `hookshot-discussion` channel; the server is mainly for
-  web ports, and that channel is where Hookshot talk belongs.
-- **Newest release:** https://github.com/NotRexed/Hookshot/releases/latest.
+- **Discord:** https://discord.gg/rexed. Use the `dev-work` channel for prs.
+- **Newest release:** https://github.com/NotRexed/Hookshot/releases/latest
 
 Thanks for testing, reporting and sending fixes. Every report from a different GPU and every area played further than
 before moves the port forward.
