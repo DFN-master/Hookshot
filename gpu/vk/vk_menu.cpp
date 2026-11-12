@@ -55,6 +55,7 @@
 #include "vk_antilag.h"
 #include "upscaler_rows.h"
 #include "menu_restart.h"
+#include "vk_menu_i18n.h"
 #ifndef HOOKSHOT_ENV_H   // (env_on: the switches' one rule)
 #include "hookshot_env.h"
 #endif
@@ -376,6 +377,18 @@ const char* hn_nr(int v, int variant) {
     }
     return variant == 0 ? t[std::clamp(v, 0, 1)] : variant == 1 ? longest : variant == 2 ? hdr_native : nullptr;
 }
+/// The Game language row (opts.game_lang): language.txt's language, written once the row is left (game_lang_tick); the game
+/// reads it at its start
+const char* tx_game_lang(int v) { return i18n::game_lang_name(v); }
+/// The Menu language row (opts.menu_lang): Auto, then each language by its own name (vk_menu_i18n.h)
+const char* tx_menu_lang(int v) {
+    if (v <= 0) return "Auto (game's language)";
+    return i18n::lang_name(v - 1);
+}
+const char* hn_menu_lang(int v, int variant) {
+    if (variant > 0) return nullptr;
+    return v <= 0 ? "Follows the game's language (language.txt in the game folder)." : "The language of this menu.";
+}
 const char* tx_percent(int v) {
     static char b[8];
     snprintf(b, sizeof b, "%d%%", v);
@@ -568,7 +581,8 @@ const char* tx_text_size(int v) {
 const char* tx_fov(int v) { return v == 100 ? "100% (original)" : tx_percent(v); }
 const char* tx_ultrawide(int v) { return v ? "Monitor's shape" : "16:9"; }   // (the Aspect ratio row: a shape, not on or off)
 const char* tx_prompts(int v) {
-    static const char* t[HOS_PROMPT_N + 1] = {"Auto", "Switch", "Xbox", "PlayStation 4", "PlayStation 5", "Steam Deck"};
+    static const char* t[HOS_PROMPT_N + 1] = {"Auto", "Switch", "Xbox", "PlayStation 4", "PlayStation 5", "Steam Deck",
+                                              "Keyboard"};
     return t[std::min(std::max(v, 0), (int)HOS_PROMPT_N)];
 }
 const char* tx_gpu(int v) {
@@ -854,7 +868,8 @@ const char* hn_astc_rgba8(int, int variant) {
                                        : nullptr;
 }
 MENU_HINTS(hn_robust, 0, "On, on every card.", "Can be faster on some NVIDIA cards.", "Always on.")
-MENU_HINTS(hn_mesh_mode, 0, "The GPU's own mesh shaders where it has them, the compute path where it has not.",
+MENU_HINTS(hn_mesh_mode, 0, "The GPU's own mesh shaders where it has them, the compute path where it has not (on Linux "
+           "AMD always the compute path: RADV's mesh shaders stop the GPU, issue 2245).",
            "The GPU's own mesh shaders for every draw. A GPU without them still uses the compute path.",
            "The compute path on every GPU: try it if your card crashes or leaves objects out. Usually a little slower.")
 MENU_HINTS(hn_fps, 0, nullptr, "The frame rate. With frame generation on, the game's own rate too.",
@@ -883,7 +898,10 @@ MENU_HINTS(hn_pad_layout, 0, "The Switch's order: A on the right, B at the botto
            "A at the bottom, B on the right; X and Y as on the Switch.",
            "Bindings of your own, from the Controls page.")
 MENU_HINTS(hn_prompts, 0,
-           "Those of the first controller, from its name (SDL's). The Switch's when it has none, as with XInput alone.")
+           "Those of the first controller, from its name (SDL's). With none, the keyboard's (the Switch's with XInput "
+           "alone).",
+           "The Switch's buttons.", "An Xbox controller's.", "A PlayStation 4 controller's.", "A PlayStation 5 controller's.",
+           "A Steam Deck's.", "The keys and mouse buttons your controls put each action on.")
 
 Row rows[] = {
     // Graphics, in sections: a heading row is a section's title (draw_options draws it, the selection steps over it). The
@@ -1001,6 +1019,10 @@ Row rows[] = {
     {TAB_GAMEPLAY, "Microphone", &opts.mic, 0, 2 + kMaxMics, 1, tx_mic,
      "What the ocarina hears when the game's microphone option is on (playing an instrument, or humming).", hn_mic, false,
      true},
+    {TAB_GAMEPLAY, "Game language", &opts.game_lang, 0, i18n::game_lang_count() - 1, 1, tx_game_lang,
+     "The game's own language, its text. Applies after a restart.", nullptr, true, true},
+    {TAB_GAMEPLAY, "Menu language", &opts.menu_lang, 0, i18n::lang_count(), 1, tx_menu_lang, "The language of this menu.",
+     hn_menu_lang, false, true},
     {TAB_GAMEPLAY, "Discord status", &opts.discord, 0, 1, 1, tx_onoff,
      "Shows \"Playing Hookshot\" and the time played in your Discord status, while Discord runs on this PC.", nullptr, false,
      true},
@@ -1360,6 +1382,7 @@ void restart_init() {
     static bool done = false;
     if (done) return;
     done = true;
+    opts.game_lang = i18n::game_lang_index();   // (language.txt's, the language the game started in)
     for (int i = 0; i < kRows; i++) {
         restart_slot[i] = rows[i].restart && rows[i].value ? restart_state.add(*rows[i].value) : -1;
         if (restart_slot[i] >= 0) restart_names[restart_slot[i]] = rows[i].name;
@@ -1387,8 +1410,14 @@ bool restart_ask() {
     restart_values(now);
     return app_window() && restart_state.ask(now);
 }
+/// The rows' names in the menu's language, for the restart line and question
+const char* const* tr_names() {
+    static const char* t[mr::kMax];
+    for (int i = 0; i < restart_state.n; i++) t[i] = i18n::tr(restart_names[i]);
+    return t;
+}
 std::string restart_list(const char* last) {
-    return mr::names(restart_names, restart_state.n, restart_pending(), ", ", last);
+    return mr::names(tr_names(), restart_state.n, restart_pending(), ", ", last);
 }
 int ask_sel = 0;   // (the restart question's choice: 0 Later, 1 Restart now)
 
@@ -1512,7 +1541,8 @@ const char* ini_key(const Row& r) {
 // (hookshot) the controls, kept by the host (host/nn_hid.c reads them back from here): pad_<button>, key_<button>
 const char* const bind_names[HOS_KEY_N] = {"a", "b", "x", "y", "ls", "rs", "l", "r", "zl", "zr", "plus", "minus",
                                            "left", "up", "right", "down", "move_up", "move_down", "move_left",
-                                           "move_right", "cam_up", "cam_down", "cam_left", "cam_right"};
+                                           "move_right", "cam_up", "cam_down", "cam_left", "cam_right",
+                                           "note_l", "note_r", "note_a", "note_y", "note_x"};
 bool can_bind() { return host && host->binding && host->bind && host->pad_raw; }
 const char* tx_pad_layout(int v) {
     static const char* t[] = {"Nintendo (Def)", "Xbox / PC", "Swap Face", "Custom"};
@@ -1625,7 +1655,7 @@ void save() {
                 const int v = saved_value(r.value);
                 const Out o = v == kCustomOutput && player_custom_output.w && env_holds(r.value) ? player_custom_output : output_at(v);
                 fprintf(f, "%s=%ux%u\n", ini_key(r), o.w, o.h);
-            } else if (r.value) {
+            } else if (r.value && r.value != &opts.game_lang) {   // (game_lang: language.txt's)
                 fprintf(f, "%s=%d\n", ini_key(r), saved_value(r.value));
             }
         }
@@ -1640,8 +1670,8 @@ void save() {
         fprintf(f, "options_version=6\n");
         fputs(others.c_str(), f);
         if (!can_bind()) fputs(kept.c_str(), f);
-        for (int i = 0; i < HOS_KEY_N && can_bind(); i++) {   // (the keys-only controls, HOS_KEY_*, have no pad_ line)
-            if (i < HOS_SW_N) {
+        for (int i = 0; i < HOS_KEY_N && can_bind(); i++) {   // (the stick's and camera's rows, HOS_KEY_MOVE_*/CAM_*, have no pad_ line; the ocarina note rows do)
+            if (i < HOS_SW_N || (i >= HOS_KEY_OC_NOTE_L && i <= HOS_KEY_OC_NOTE_X)) {
                 const int alternate = host->binding(HOS_BIND_PAD, i, 1);
                 fprintf(f, "pad_%s=%d", bind_names[i], host->binding(HOS_BIND_PAD, i, 0));
                 if (alternate >= 0) fprintf(f, ",%d", alternate);
@@ -2076,7 +2106,7 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
         *r.value = v > r.hi ? r.lo : v < r.lo ? r.hi : v;
         apply_preset(*r.value);
     } else {
-        *r.value = v > r.hi ? r.lo : v < r.lo ? r.hi : v;
+        *r.value = v > r.hi ? r.lo : v < r.lo ? r.hi : v;   // (Game language: written when the row is left, game_lang_tick)
         // (another Upscaler: the Render resolution moves to the nearest of its steps, DLSS's modes or the game's)
         if (r.value == &opts.dlss) {   // (a slider stop kept)
             opts.resolution = ur::snap_render(upscaler(), opts.resolution);
@@ -2096,6 +2126,8 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
     // (hookshot: the samplers made again, at once: their anisotropy, and the upscalers' LOD bias, vk_draw.cpp upscale_lod_bias)
     if (r.value == &opts.anisotropy || r.value == &opts.dlss || r.value == &opts.resolution || r.value == &opts.preset)
         samplers_changed();
+    if (r.value == &opts.dlss || r.value == &opts.resolution || r.value == &opts.dlss_model)
+        temporal_reset_failure();
     prompts_at_once(r);   // (hookshot)
     {   // (a row that takes a restart, or a preset that sets one: asked again at the next close)
         int now[mr::kMax];
@@ -2118,16 +2150,19 @@ const Control controls[] = {{HOS_SW_A, "A"}, {HOS_SW_B, "B"}, {HOS_SW_X, "X"}, {
                             {HOS_KEY_MOVE_DOWN, "Move back"}, {HOS_KEY_MOVE_LEFT, "Move left"},
                             {HOS_KEY_MOVE_RIGHT, "Move right"}, {HOS_KEY_CAM_UP, "Camera up"},
                             {HOS_KEY_CAM_DOWN, "Camera down"}, {HOS_KEY_CAM_LEFT, "Camera left"},
-                            {HOS_KEY_CAM_RIGHT, "Camera right"}};
+                            {HOS_KEY_CAM_RIGHT, "Camera right"}, {HOS_KEY_OC_NOTE_L, "Ocarina note (L)"},
+                            {HOS_KEY_OC_NOTE_R, "Ocarina note (R)"}, {HOS_KEY_OC_NOTE_A, "Ocarina note (A)"},
+                            {HOS_KEY_OC_NOTE_Y, "Ocarina note (Y)"}, {HOS_KEY_OC_NOTE_X, "Ocarina note (X)"}};
 constexpr int kControls = sizeof controls / sizeof controls[0];   // (then "Reset to defaults")
-bool keys_only(int i) { return i < kControls && controls[i].button >= HOS_SW_N; }   // (no gamepad input for those)
+// (the stick's and camera's directions: keys only; the ocarina's note rows take a gamepad input too, host/nn_hid.c)
+bool keys_only(int i) { return i < kControls && controls[i].button >= HOS_KEY_MOVE_UP && controls[i].button <= HOS_KEY_CAM_RIGHT; }
 // a pad input's name on the controller of the button prompts (the Button prompts row's choice; Auto: the face in use),
 // else by its place
 const char* pad_name(int p) {
     if (p < 0 || p >= HOS_PAD_N) return "None";
     static const char* paddles[] = {"R4", "L4", "R5", "L5"};
     if (p >= HOS_PAD_RPADDLE1) return paddles[p - HOS_PAD_RPADDLE1];
-    static const char* t[HOS_PROMPT_N + 1][HOS_PAD_RPADDLE1] = {   // (by place, then HOS_PROMPT_*)
+    static const char* t[HOS_PROMPT_KEYBOARD + 1][HOS_PAD_RPADDLE1] = {   // (by place, then HOS_PROMPT_*; the keyboard's: by place)
         {"Bottom button", "Right button", "Left button", "Top button", "Select / Back", "Home", "Start", "L stick press",
          "R stick press", "L1 / LB", "R1 / RB", "D-pad up", "D-pad down", "D-pad left", "D-pad right", "L2 / LT", "R2 / RT"},
         {"B", "A", "Y", "X", "Minus", "Home", "Plus", "L stick press", "R stick press", "L", "R", "D-pad up",
@@ -2141,7 +2176,7 @@ const char* pad_name(int p) {
         {"A", "B", "X", "Y", "View", "Steam", "Menu", "L3", "R3", "L1", "R1", "D-pad up", "D-pad down", "D-pad left",
          "D-pad right", "L2", "R2"}};
     const int face = opts.prompts ? opts.prompts - 1 : host && host->prompt_face ? host->prompt_face() : -1;
-    return t[face >= 0 && face < HOS_PROMPT_N ? face + 1 : 0][p];
+    return t[face >= 0 && face < HOS_PROMPT_KEYBOARD ? face + 1 : 0][p];
 }
 const char* key_name(int vk) {
     static char b[16];
@@ -2480,8 +2515,14 @@ std::string restart_line(ui::Ctx& c, float px, float width) {
         int named = 0, more = 0;
         for (int i = 0; i < restart_state.n; i++)
             if ((all >> i) & 1) (named < keep ? (shown |= 1u << i, named++) : more++);
-        line = "Restart needed: " + mr::names(restart_names, restart_state.n, shown);
-        if (more) line += (named ? " and " : "") + std::to_string(more) + (named ? " more" : more > 1 ? " settings" : " setting");
+        const char* names[mr::kMax];
+        for (int i = 0; i < restart_state.n; i++) names[i] = i18n::tr(restart_names[i]);
+        line = i18n::tr("Restart needed: ") + mr::names(names, restart_state.n, shown);
+        if (more) {   // (" settings (many)": the form Russian and Polish take for 5 and up, i18n::plural; never asked in English)
+            const int form = i18n::plural(more);
+            line += std::string(named ? i18n::tr(" and ") : "") + std::to_string(more) +
+                    i18n::tr(named ? " more" : form == 0 ? " setting" : form == 1 ? " settings" : " settings (many)");
+        }
         if (ui::size_of(c.f.strong, px, line.c_str()).x <= width) break;
     }
     return line;
@@ -2951,7 +2992,8 @@ void draw_controls(ui::Ctx& c) {
                                     "selected input and Delete clears it. A button's only gamepad input stays with it: it does not move into "
                                     "another's empty Input 2. The game's button icons follow after a restart.";
     const char* hint = page_row ? (page_row->hint ? page_row->hint(*page_row->value, -1) : nullptr)
-                                : "Gamepad: the D-pad moves, A binds, B goes back.";
+                                : "Gamepad: the D-pad moves, A binds, B goes back. Ocarina note keys are only notes while "
+                                  "the ocarina waits for one; away from it they do their other jobs.";
     float bottom = std::min(c.h - c.safe, bar_top) - 10 * s;   // (the rows end above the prompts)
     if (narrow) {
         bottom = std::min(bar_top, c.h - c.safe) - 200 * s;
@@ -3305,7 +3347,7 @@ void draw_ask(ui::Ctx& c) {
     c.d->AddRectFilledMultiColor(p, ImVec2(q.x, p.y + hb), ui::kBannerTop, ui::kBannerTop, ui::kBanner, ui::kBanner);
     c.d->AddRectFilled(ImVec2(p.x, p.y + hb - 3 * s), ImVec2(q.x, p.y + hb), ui::kBannerEdge);
     ui::text_mid_centre(c, c.f.heading, 23 * s, (p.x + q.x) * 0.5f, p.y + hb * 0.5f, ui::kBannerInk, "Restart Needed");
-    const std::string ask = "Restart to apply " + restart_list(" and ") + "?";
+    const std::string ask = i18n::tr("Restart to apply ") + restart_list(i18n::tr(" and ")) + "?";
     ui::para(c, c.f.body, 19 * s, ImVec2(p.x + 28 * s, p.y + 64 * s), ui::kInk, ask.c_str(), W - 56 * s);
     ui::text_mid(c, c.f.body, 16 * s, p.x + 28 * s, p.y + 124 * s, ui::kSoft, "Progress since your last save is lost.");
     const float bw = 210 * s, bh = 46 * s, gap = 24 * s, by = p.y + 160 * s, x0 = (p.x + q.x) * 0.5f - bw - gap * 0.5f;
@@ -3797,7 +3839,7 @@ void menu_init() {
             if (!eq) continue;
             *eq = 0;
             for (Row& r : rows) {
-                if (!r.value || strcmp(line, ini_key(r))) continue;
+                if (!r.value || r.value == &opts.game_lang || strcmp(line, ini_key(r))) continue;
                 const int v = atoi(eq + 1);
                 *r.value = r.value == &opts.output_res ? parse_output(eq + 1) : std::min(std::max(v, r.lo), r.hi);
             }
@@ -3841,8 +3883,10 @@ void menu_init() {
         // (the Aspect ratio from options_version 6: a file from before wrote ultrawide=0, the 16:9 default then, whether
         // chosen or not. On a screen narrower than 16:9 host/hos_main.c starts the game at the monitor's shape for it
         // (host/hos_wide_size.h hos_aspect_on), and the row follows what the host started with: a picture narrower than
-        // 16:9 there. On Linux too, where the menu has no screen size of its own)
-        if (version < 6 && opts.ultrawide == 0 && host && host->aspect_ratio) {
+        // 16:9 there. On Linux too, where the menu has no screen size of its own. Not with HOS_ASPECT, a debugging switch
+        // the host takes instead of the file: the shape it started with is then the switch's, not a move, and the next save
+        // would keep a choice the player never made)
+        if (version < 6 && opts.ultrawide == 0 && !getenv("HOS_ASPECT") && host && host->aspect_ratio) {
             const float started = host->aspect_ratio();
             if (started > 1.0f && started < 16.0f / 9.0f * 0.99f) opts.ultrawide = 1;
         }
@@ -4218,10 +4262,31 @@ void cheat_press(int i, const bool* press, bool& changed) {
     }
 }
 
+/// (hookshot) The Game language row's choice written to language.txt once the player leaves the row (another row, page or
+/// tab, or the menu closed), not at each step on the way to it. When it cannot be written (a read-only folder) the row goes
+/// back to what language.txt says, so it never shows a language that was not saved
+void game_lang_tick() {
+    static const int row = [] {
+        for (int i = 0; i < kRows; i++)
+            if (rows[i].value == &opts.game_lang) return i;
+        return -1;
+    }();
+    if (row < 0 || opts.game_lang == i18n::game_lang_index()) return;
+    const bool on_row = open_now.load() && page == 0 && cur_tab == rows[row].tab &&
+                        tab_row_to_global(cur_tab, tab_selected[cur_tab]) == row;
+    if (on_row) return;
+    if (!i18n::set_game_language(opts.game_lang)) {
+        logf("menu: language.txt could not be written: the game language stays %s", i18n::game_lang_code(i18n::game_lang_index()));
+        opts.game_lang = i18n::game_lang_index();
+        menu_refresh = true;
+    }
+}
+
 void menu_tick() {
     std::lock_guard lk(menu_mu);   // (the control bridge's settings: menu_setting_set)
     share_finish();   // (Save my pipeline list's worker, done)
     fullscreen_tick();
+    game_lang_tick();
     enum { K_N = 17 };
     static bool held[K_N];
     static const int keys[K_N] = {VK_INSERT, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_ESCAPE, VK_F1,   // (F1: for keyboards without Insert)
@@ -4393,7 +4458,11 @@ void menu_tick() {
         }
     } else if (open_now.load() && page == 1) {   // (hookshot) the Controls page
         using enum menu_hit::CtlColumn;
-        if (!can_bind()) page = 0;
+        if (!can_bind()) {
+            static int warned;
+            if (!warned) warned = 1, logf("menu: the Controls page asked for the host's bindings and got none");
+            page = 0;
+        }
         else if (listening) {
             if (press[5] || prof_now() > listen_end) listening = 0, changed = true;   // (Esc, or nothing for a while)
             else if (listening == 1) {

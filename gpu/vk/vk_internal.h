@@ -143,6 +143,8 @@ void memory_table_begin();                         // (hookshot: a recording's p
 bool memory_table_flush();
 uint64_t memory_guest_pages();                        // (hookshot: the device address of guest memory's page table, 0: none)
 void memory_sync();                                   // (at each submit: pools the game made or let go)
+extern std::atomic<int64_t> memsync_lock_wait_ns;     // (hookshot, diagnostics: time memory_sync waited for its two locks; the slow-submit line)
+extern std::atomic<int64_t> memsync_part_ns[3];       // (hookshot, diagnostics: submit_memory_work's memory_sync, memory_take_capture, memory_collect_written)
 BufferRef gpu_buffer(uint64_t gpu, uint64_t size);   // (empty when no pool holds the range)
 /// A range as a binding of the replay sees it: the pool's VRAM mirror when it has one (vk_memory.cpp), else the
 /// imported pool. written: the GPU may write it (copied back to guest memory at the submission's end).
@@ -252,6 +254,7 @@ bool memory_has_shadow(uint64_t guest, uint64_t n);
 /// A read of guest memory by the replay as the submission being recorded had it: the pages a kept capture holds from
 /// there (the game writes several submits ahead of the replay), the rest from guest memory. False when unreadable
 bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n);
+bool pools_mirrored();   // (vk_memory.cpp mirror_on: the buffer pools have VRAM mirrors)
 uint64_t memory_capture_view();          // (bumped when a capture is published or any page is stamped)
 uint32_t memory_page_stamp(uint64_t gpu); // (that address's page only)
 uint64_t gpu_pool_end(uint64_t gpu);   // (hookshot) where the memory pool holding that address ends, 0: in none (vk_memory.cpp)
@@ -259,6 +262,7 @@ uint64_t gpu_pool_start(uint64_t gpu); // (EvilOOT) and where it begins
 bool create_buffer_cached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation,
                           void** mapped, bool dedicated = false);   // (vk_vma.cpp: cached host memory, mapped)
 void flush_mapped(VmaAllocation allocation, uint64_t size);
+bool host_cached(VmaAllocation allocation);   // (its memory type has VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
 void flush_mapped_range(VmaAllocation allocation, uint64_t offset, uint64_t size);
 void invalidate_mapped(VmaAllocation allocation, uint64_t size);   // (the CPU is to read what the GPU wrote: a no-op in coherent memory)
 bool flush_mapped_checked(VmaAllocation allocation, uint64_t size);

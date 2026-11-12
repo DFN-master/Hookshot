@@ -290,10 +290,23 @@ void wait_value(uint64_t v) {
     wi.pValues = &v;
     vkWaitSemaphores(dev.device, &wi, UINT64_MAX);
 }
+bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok);
 } // namespace
 uint64_t vk_timeline_completed() { return timeline ? completed() : 0; }
 void vk_timeline_wait(uint64_t v) {   // (at most 250 ms: a submission held back behind the caller's thread goes on without it)
     if (!timeline || completed() >= v) return;
+    // (a burst recording whose write-back stamped wb_pages with burst_value does not advance `timeline` while an older queue
+    // submission is stopped at an event wait; wait on `rec_timeline` where that recording actually signalled completion)
+    int ok = 0;
+    if (wait_recorded(v, 250000000ull, &ok)) {
+        if (!ok) {
+            static std::atomic<int> logged{0};
+            if (logged++ < 8)
+                logf("vk: a capture's wait for write-back %llu timed out (done %llu)", (unsigned long long)v,
+                     (unsigned long long)completed());
+        }
+        return;
+    }
     queue_flush_for(FR_VALUE);
     VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
     wi.semaphoreCount = 1;
@@ -1774,8 +1787,13 @@ void bench_frame(int64_t presents) {
 struct SlowWatch {
     std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
     int64_t prof0[PROF_COUNT];
+    int64_t ms0[4];   // (hookshot: memory sync's parts and the lock wait, at the start)
     const char* what;
-    explicit SlowWatch(const char* w) : what(w) { std::memcpy(prof0, prof_ns, sizeof prof0); }
+    explicit SlowWatch(const char* w) : what(w) {
+        std::memcpy(prof0, prof_ns, sizeof prof0);
+        for (int i = 0; i < 3; i++) ms0[i] = memsync_part_ns[i].load(std::memory_order_relaxed);
+        ms0[3] = memsync_lock_wait_ns.load(std::memory_order_relaxed);
+    }
     ~SlowWatch() {
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         static int logged;
@@ -1790,6 +1808,15 @@ struct SlowWatch {
             const double d = (prof_ns[i] - prof0[i]) / 1e6;
             if (d >= 1.0) k += snprintf(line + k, sizeof line - k, " %s %.1f", names[i], d);
         }
+        {   // (hookshot: which part of "memory sync" it was: the pools' refresh [and its lock waits], the capture, the written pages collected.
+            // Counted across threads, so a part another thread spent meanwhile shows too)
+            const double a = (memsync_part_ns[0].load(std::memory_order_relaxed) - ms0[0]) / 1e6,
+                         b = (memsync_part_ns[1].load(std::memory_order_relaxed) - ms0[1]) / 1e6,
+                         c = (memsync_part_ns[2].load(std::memory_order_relaxed) - ms0[2]) / 1e6,
+                         w = (memsync_lock_wait_ns.load(std::memory_order_relaxed) - ms0[3]) / 1e6;
+            if (a + b + c >= 1.0 || w >= 1.0)
+                k += snprintf(line + k, sizeof line - k, " [memory sync: maps %.1f (lock waits %.1f), capture %.1f, collect %.1f]", a, w, b, c);
+        }
         logf("%s", line);
     }
 };
@@ -1800,6 +1827,8 @@ void submit_memory_work(uint64_t value) {
     PROF(PROF_MEMSYNC);
     const auto m0 = std::chrono::steady_clock::now();
     memory_sync();
+    const auto m1a = std::chrono::steady_clock::now();
+    memsync_part_ns[0] += std::chrono::duration_cast<std::chrono::nanoseconds>(m1a - m0).count();
     // (the capture takes only the mirrored pools' pages, the collection the rest: skipping it whenever a capture was
     // taken, which with the replay thread is at every submit, left every other CPU write uncollected. Textures never
     // saw them: MK World's font cache kept its first glyphs (the menus lost letters), CPU-streamed terrain went stale)
@@ -1808,6 +1837,8 @@ void submit_memory_work(uint64_t value) {
     const auto m2 = std::chrono::steady_clock::now();
     memory_collect_written();
     const auto m3 = std::chrono::steady_clock::now();
+    memsync_part_ns[1] += std::chrono::duration_cast<std::chrono::nanoseconds>(m2 - m1).count();
+    memsync_part_ns[2] += std::chrono::duration_cast<std::chrono::nanoseconds>(m3 - m2).count();
     {   // (every 600 submits: what the memory work before a submit's recording cost)
         static double a, b, c;
         static int64_t k;
@@ -2251,7 +2282,7 @@ uint64_t get_replayed() {
 /// timeline: true when that recording is known (the result in *ok), false when it is not (f not finished yet)
 static void wait_rec_seq(uint64_t seq, uint64_t timeout_ns, int* ok);
 bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok) {
-    if (!rec_timeline || per_queue_fences_off()) return false;
+    if (!rec_timeline) return false;
     uint64_t seq = 0;
     {
         std::lock_guard mk(rec_map_mu);
