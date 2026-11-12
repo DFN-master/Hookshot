@@ -1,5 +1,9 @@
 # Changelog
 
+## [2.2.0](https://github.com/notquiteog/Hookshot/releases/tag/v2.2.0) (2026-11-12)
+
+Release candidate [v2.2.0-rc.3](https://github.com/notquiteog/Hookshot/releases/tag/v2.2.0-rc.3), published as 2.2.0. Its changes are in its release candidates' entries below.
+
 ## [2.2.0-rc.3](https://github.com/notquiteog/Hookshot/compare/v2.2.0-rc.2...v2.2.0-rc.3) (2026-11-12)
 
 
