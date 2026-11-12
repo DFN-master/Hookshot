@@ -144,13 +144,16 @@ def wait_for_login_token(port_holder, ready, timeout):
         def do_GET(self):
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
             token = (query.get("loginToken") or [None])[0]
-            self.send_response(200 if token else 400)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            text = "Signed in. You can close this tab." if token else "No login token in this request."
-            self.wfile.write(("<!doctype html><title>Hookshot team chat</title><p>%s</p>" % text).encode("utf-8"))
             if token:
-                found["token"] = token
+                found["token"] = token   # (kept even if the browser closes the tab before the page below is sent)
+            text = "Signed in. You can close this tab." if token else "No login token in this request."
+            try:
+                self.send_response(200 if token else 400)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(("<!doctype html><title>Hookshot team chat</title><p>%s</p>" % text).encode("utf-8"))
+            except OSError:
+                pass   # (the browser went away first, e.g. WinError 10053; the token above is what matters)
 
         def log_message(self, *args):
             pass
@@ -272,6 +275,8 @@ def post(args):
     alias = args.room or config.get("room", ROOM)
     text = args.text if args.text is not None else sys.stdin.read()
     text = text.strip()
+    while text.startswith(PREFIX.strip()):  # the robot is added below; one written by the agent would show twice
+        text = text[len(PREFIX.strip()):].lstrip()
     if not text:
         raise ChatError("nothing to post")
     now = time.time()
@@ -303,7 +308,22 @@ def read(args):
         print("%s %s: %s" % (when, event.get("sender"), content["body"]))
 
 
+def unicode_output():
+    """Messages carry the robot and whatever people wrote. Into a pipe (an agent's tool, `| more`) Windows' Python writes
+    the ANSI code page, cp1252, which has no emoji: read stopped at the first post with a UnicodeEncodeError. A pipe gets
+    UTF-8, as -X utf8 would give it; a console keeps its own encoding. Either way a character it cannot show is replaced
+    instead of ending the command."""
+    for stream in (sys.stdout, sys.stderr):
+        if not hasattr(stream, "reconfigure"):   # (a StringIO, as in the test)
+            continue
+        if stream.isatty():
+            stream.reconfigure(errors="replace")
+        else:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main(argv=None):
+    unicode_output()
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("login", help="sign in with Discord and save the session")

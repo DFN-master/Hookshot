@@ -94,6 +94,11 @@ static int free_look(void) {
     return (state == STATE_FOLLOWS || state == STATE_PLAYER) && game_free != 0;
 }
 
+/* The Controls row "Disable camera centering" (option 45), independent of the mouse mode. The game's state-3 yaw-follow
+   branch asks before it runs (nx2/oot_patches.py); 0 keeps the stock behavior, including without a renderer. (#2617 took it
+   out with its rewrite of this file; the lifted game still calls it, and the link failed without it) */
+int hos_disable_camera_centering(void) { return rx_option(45, 0); }
+
 /* nn_hid.c, with each read of the controller: 1 while the game leaves the camera to the player, 0 while it takes the
    right stick for its own use (ZR, the bow's aim; L, the item wheel; R) */
 void hos_mouse_native_free(int free) { InterlockedExchange(&game_free, free ? 1 : 0); }
@@ -102,10 +107,6 @@ void hos_mouse_native_free(int free) { InterlockedExchange(&game_free, free ? 1 
    camera this frame. The game has then moved the angles itself, so they are the mouse's new start: the stick and the
    mouse both turn the camera instead of undoing each other. */
 void hos_mouse_native_stick(int held) { InterlockedExchange(&stick_held, held ? 1 : 0); }
-
-/* The Controls row "Disable camera centering" (option 45), independent of the mouse mode. The game's state-3 yaw-follow
-   branch asks before it runs (nx2/oot_patches.py); 0 keeps the stock behavior, including without a renderer. */
-int hos_disable_camera_centering(void) { return rx_option(45, 0); }
 
 /* f_80644c80's first line (nx2/oot_patches.py): cam is the player camera, the game's thread */
 void hos_mouse_camera(uint64_t cam) {
@@ -119,9 +120,7 @@ void hos_mouse_camera(uint64_t cam) {
     if (state != 3 && state != 4) {
         /* (at once: the stick takes the next motion, not one burst once the 150 ms run out) */
         InterlockedExchange64(&last_hook_ns, 0);
-        /* (and the mouse's angles are let go, as where the game takes the stick below: the game turns this camera
-           itself now, so where it leaves it is the mouse's start once it is 3 or 4 again, not the view from before) */
-        target_ok = 0;
+        target_ok = 0;   /* the game's angles may change while another camera owns the view */
         /* (each state seen leaving the mouse to the stick, once: what another view, Z-targeting, climbing or swimming,
            is, to add here if one of them should turn with the mouse) */
         static uint32_t said[8];
