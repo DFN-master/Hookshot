@@ -14,6 +14,9 @@ bool framegen_scene_inputs_wanted();
 /// (hookshot fork) What AMD's frame generation makes on this PC (framegen_methods.h Here): the most frames between two of
 /// the game's, 0 where it does not run. For the Insert menu's Frame generation by row and its hints
 framegen_methods::Here framegen_here();
+/// (hookshot fork) Whether the Frame generation by row in effect is Auto: chosen, or shown in place of a saved method that
+/// does not run on this PC (framegen_methods.h effective). NVIDIA DLSS Frame Generation runs at Auto
+bool framegen_by_auto();
 /// Records the frame's processing into the present's recording (src: the window texture's view, sw x sh, the crop
 /// x, y, w, h); false when interpolation cannot run (the present goes to the window as without it)
 bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t sh, const int crop[4]);

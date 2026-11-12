@@ -788,6 +788,16 @@ int framegen_method() {
     return fgm::effective(env_method >= 0 ? env_method : opts.framegen_by, fgm::available(framegen_here()));
 }
 
+/// (hookshot fork) Whether the row in effect is Auto, which is what NVIDIA DLSS Frame Generation runs at (vk_dlss.cpp
+/// fg_asked): Auto itself, or a saved AMD method that does not run on this PC, which the menu shows as Auto. The backends
+/// are asked only for such a saved choice, not at Auto or Built-in
+bool framegen_by_auto() {
+    namespace fgm = framegen_methods;
+    static const bool env_set = fgm::from_name(getenv("RX_VK_FG_METHOD")) >= 0;
+    if (!env_set && (opts.framegen_by == fgm::AUTO || opts.framegen_by == fgm::BUILTIN)) return opts.framegen_by == fgm::AUTO;
+    return framegen_method() == fgm::AUTO;
+}
+
 /// (hookshot fork) Whether AMD FSR 4's frame generation makes sets of multiplier m now: the row at AMD FSR 4, at a fixed
 /// multiplier it makes whole here (framegen_methods.h makes_set)
 bool ffx_set_wanted(int m) {
@@ -799,7 +809,7 @@ bool ffx_set_wanted(int m) {
 /// scene's depth and motion (vk_fsr3_inputs.h, as FSR 3.1's interpolation above takes them) handed over as images, and
 /// every made frame in one dispatch. `want` when it made them all into set.frame[0..want), else 0, which leaves the whole
 /// set to the interpolation below: a half-made set would show a stale image.
-int ffx_frames(VkCommandBuffer cmd, OutSet& set, int cur, uint32_t uw, uint32_t uh, int want) {
+int ffx_frames(VkCommandBuffer cmd, OutSet& set, int cur, uint32_t uw, uint32_t uh, int want, uint64_t sequence) {
     static uint64_t asked = 0, made = 0, no_inputs = 0;
     if (++asked % 600 == 0)
         logf("vk: amd fsr 4 frame generation: %llu of the last 600 sets, %llu without its inputs (the renderer's own made "
@@ -825,6 +835,7 @@ int ffx_frames(VkCommandBuffer cmd, OutSet& set, int cur, uint32_t uw, uint32_t 
         in.camera_up[c] = camera.up[c], in.camera_forward[c] = camera.forward[c];
     }
     in.reset = f.reset;
+    in.sequence = sequence;
     in.frames = (uint32_t)want;
     if (!ffx::generate(cmd, in)) return 0;
     for (int k = 1; k <= want; k++)
@@ -871,7 +882,10 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         set->busy = true;
         fg.next_set = (fg.next_set + 1) % 3;
     }
-    const int cur = fg.cur, prev = cur ^ 1, m = multiplier();
+    // (the multiplier the sets were made for, ensure_size above: the row read again here could be one step up by now, the
+    // menu runs on the display thread, and the set's last image would be one that was never made)
+    const int cur = fg.cur, prev = cur ^ 1, m = fg.mult;
+    const bool auto_rate = opts.framegen == 1;   // (read once, for the same reason)
     const bool blend = fg.have_prev && !gap;
     set->reflex_id = reflex_frame();   // (NVIDIA Reflex: the game frame this set shows, vk_reflex.cpp)
     static uint64_t sequence = 0;
@@ -885,7 +899,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     pass(cmd, fg.luma, {{fg.frames[cur].view, fg.nearest}, {fg.lumas[cur].view, VK_NULL_HANDLE}}, qw, qh);
     set->made = 0;
     set->shown = -1;
-    if (opts.framegen == 1) {   // (Auto: a frame for each of the display's refreshes, at its own time)
+    if (auto_rate) {   // (Auto: a frame for each of the display's refreshes, at its own time)
         const int mhz = display_refresh_mhz();
         const int64_t period = (int64_t)(1e12 / (mhz > 0 ? mhz : 60000));
         float t[kMaxMult];
@@ -940,7 +954,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     if (set->made == 0 && blend && m == 2 && fsr3fi::frames_wanted()) set->made = fsr3fi_frame(cmd, *set, cur, uw, uh, sequence);
     // (hookshot fork) The row's AMD FSR 4 frame generation (vk_ffx.h), where AMD's runtime is here and makes a set of this
     // size; any present it does not take stays with the interpolation below
-    if (set->made == 0 && blend && m > 1 && ffx_set_wanted(m)) set->made = ffx_frames(cmd, *set, cur, uw, uh, m - 1);
+    if (set->made == 0 && blend && m > 1 && ffx_set_wanted(m)) set->made = ffx_frames(cmd, *set, cur, uw, uh, m - 1, sequence);
     if (set->made == 0 && blend && m > 1) {
         pass(cmd, fg.flow, {{fg.lumas[prev].view, fg.nearest}, {fg.lumas[cur].view, fg.nearest},
                             {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch);

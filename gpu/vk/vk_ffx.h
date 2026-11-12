@@ -40,6 +40,8 @@ struct FrameInputs {
     /// The camera in the world (camera_vectors.h: forward is the way it looks)
     float camera_position[3]{}, camera_right[3]{}, camera_up[3]{}, camera_forward[3]{};
     bool reset = false;
+    /// The present's number (vk_framegen.cpp framegen_record's): one that does not follow the last made one is a reset
+    uint64_t sequence = 0;
     uint32_t frames = 1;   ///< how many to make between the last frame and this one (1 to max_frames())
 };
 

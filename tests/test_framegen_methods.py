@@ -36,15 +36,22 @@ def main():
              "vk_framegen.cpp choosing through framegen_methods.h"),
             ("ffx::max_frames()", fg, "FSR 4 frame generation within its limit"),
             ("set->made = dlss_fg_frames(", fg, "upstream's DLSS Frame Generation first, as upstream has it"),
-            ("if (set->made == 0 && blend && m > 1 && ffx_set_wanted(m)) set->made = ffx_frames(cmd, *set, cur, uw, uh, m - 1);",
+            ("if (set->made == 0 && blend && m > 1 && ffx_set_wanted(m)) set->made = ffx_frames(cmd, *set, cur, uw, uh, m - 1, sequence);",
              fg, "FSR 4 frame generation making the sets it makes whole, after DLSS's and before the renderer's own"),
-            ("return opts.framegen_by == framegen_methods::FSR3 ? 1u : 0u;", fi, "the row's AMD FSR 3.1 asking for it")):
+            ("return opts.framegen_by == framegen_methods::FSR3 && opts.framegen == 2 ? 1u : 0u;", fi, "the row's AMD FSR 3.1 asking for it")):
         if needle not in where:
             raise SystemExit("missing: %s (%s)" % (what, needle))
-    # (DLSS Frame Generation is Auto's alone: vk_dlss.cpp's fg_asked reads the row as upstream wrote it)
+    # (DLSS Frame Generation is Auto's alone, and Auto as the row shows it: a saved AMD method that does not run on this PC
+    # is shown as Auto, and fg_asked takes it as Auto too, through framegen_by_auto, which asks the backends only for such
+    # a saved choice)
     dlss = (ROOT / "gpu" / "vk" / "vk_dlss.cpp").read_text(encoding="utf-8")
-    if "return fg_possible() && (forced || opts.framegen_by == 0);" not in dlss:
-        raise SystemExit("vk_dlss.cpp fg_asked no longer reads Frame generation by's Auto as 0")
+    if "return fg_possible() && (forced || framegen_by_auto());" not in dlss:
+        raise SystemExit("vk_dlss.cpp fg_asked no longer reads Frame generation by's Auto as the row shows it")
+    by_auto = fg[fg.index("bool framegen_by_auto() {"):]
+    by_auto = by_auto[:by_auto.index("\n}\n")]
+    for needle in ("opts.framegen_by == fgm::AUTO || opts.framegen_by == fgm::BUILTIN", "return framegen_method() == fgm::AUTO;"):
+        if needle not in by_auto:
+            raise SystemExit("vk_framegen.cpp framegen_by_auto: missing %s" % needle)
     # (the choice is read each frame, so the menu's change reaches the next frame: not cached in a static)
     if "static const int chosen" in fg or "static int chosen" in fg:
         raise SystemExit("vk_framegen.cpp caches the method: a change in the menu would wait for a restart")

@@ -35,6 +35,7 @@
 #include "dlss_checks.h"
 #include "upscaler_rows.h"
 #include "vk_menu.h"
+#include "vk_framegen.h"   // (hookshot fork: framegen_by_auto, the Frame generation by row in effect)
 #include "vk_paths.h"
 #include "vk_reactive.h"
 #include "vk_temporal.h"
@@ -97,6 +98,9 @@ struct State {
     // (the preset, output and HDR a creation failed for: not tried again each frame, but once any of them changes, so the
     // menu's DLSS rows bring DLSS back without a restart. 0: none failed)
     uint64_t refused = 0;
+    // (the last evaluation's result, and how many times in a row it failed that way: what its log line is spaced by)
+    NVSDK_NGX_Result eval_result = NVSDK_NGX_Result_Success;
+    uint64_t eval_repeats = 0;
 };
 State& st() {
     static State s;
@@ -382,7 +386,9 @@ int prepare(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t
             logf("vk: NVIDIA DLSS: the render size %ux%u is a little outside quality mode %d's range (%ux%u to %ux%u): taken by "
                  "it (a rounded size)", rw, rh, (int)mode, ranges[k].min_w, ranges[k].min_h, ranges[k].max_w, ranges[k].max_h);
     }
-    const uint64_t key = (uint64_t)ow << 44 ^ (uint64_t)oh << 24 ^ (uint64_t)preset << 1 ^ (hdr ? 1 : 0) ^ 1ull << 63;
+    // (the quality mode with them: the Render resolution row asks for another feature of the same output)
+    const uint64_t key = (uint64_t)ow << 44 ^ (uint64_t)oh << 24 ^ (uint64_t)((int)mode & 7) << 8 ^ (uint64_t)preset << 1 ^
+                         (hdr ? 1 : 0) ^ 1ull << 63;
     if (s.refused == key) return *fail = "its feature was not made", 0;
     if (s.feature) {   // (the old one, once a new one is to be made)
         NVSDK_NGX_Handle* old = s.feature;
@@ -432,6 +438,7 @@ int prepare(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t
 
 bool start() { return ngx_init(); }
 
+void release();
 bool evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
     State& s = st();
     NVSDK_NGX_Resource_VK color = resource(f.color, false), depth = resource(f.depth, false), mv = resource(f.motion, false),
@@ -456,14 +463,25 @@ bool evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
     const NVSDK_NGX_Result r = NGX_VULKAN_EVALUATE_DLSS_EXT(cmd, s.feature, s.params, &ep);
     note_work();   // (as at its creation: the barrier after it, and the game's next one, are recorded)
     if (NVSDK_NGX_FAILED(r)) {
-        logf("vk: NVIDIA DLSS: its evaluation failed (%#x)", (unsigned)r);
+        // (the chain tries again at the next frame, kEngine's retry: one that keeps failing says so when its result changes
+        // and every 600th time, as the chain's own reason does, not on every frame)
+        if (r != s.eval_result || ++s.eval_repeats % 600 == 0)
+            logf("vk: NVIDIA DLSS: its evaluation failed (%#x)", (unsigned)r);
+        if (r != s.eval_result) s.eval_result = r, s.eval_repeats = 0;
+        // (half a second of them in a row: the feature is let go once, and prepare makes a new one for the next frame)
+        if (s.eval_repeats == 30) {
+            logf("vk: NVIDIA DLSS: 30 evaluations in a row failed: its feature is made again");
+            release();
+        }
         return false;
     }
+    s.eval_result = NVSDK_NGX_Result_Success;
     return true;
 }
 
 void release() {
     State& s = st();
+    s.refused = 0;   // (another engine chosen, or the chain idle: DLSS asked again makes its feature again)
     if (!s.feature) return;
     NVSDK_NGX_Handle* old = s.feature;
     temporal_later([old] { NVSDK_NGX_VULKAN_ReleaseFeature(old); });
@@ -559,6 +577,8 @@ const wchar_t* dlss_ngx_data_path() {
     return path.c_str();
 }
 
+void dlss_retry() { st().refused = 0; }
+
 void dlss_probe() {
     if (dlss_why() != DLSS_OK || g_why.load(std::memory_order_relaxed) >= 0 || !dev.device) return;
     ngx_init();
@@ -638,7 +658,9 @@ bool fg_possible() {
 /// while the game runs)
 bool fg_asked() {
     static const bool forced = env_switch("RX_VK_DLSS_FG") > 0;
-    return fg_possible() && (forced || opts.framegen_by == 0);
+    // (hookshot fork: Auto as the row shows it, vk_framegen.cpp framegen_by_auto: a saved AMD method that does not run on
+    // this PC is Auto too, where the raw value left every set to the renderer's own under a row reading "Auto")
+    return fg_possible() && (forced || framegen_by_auto());
 }
 
 /// A 4x4 inverse in doubles (a float one of a projection with a far plane in the thousands loses what reprojection needs)
@@ -1138,6 +1160,7 @@ bool dlss_ngx_runtime(const char*, std::string* where, std::string* found) {
 }
 const TemporalEngine* dlss_engine() { return nullptr; }
 void dlss_probe() {}
+void dlss_retry() {}
 void dlss_instance_extensions(std::vector<const char*>&, const std::vector<VkExtensionProperties>&) {}
 void dlss_device_extensions(std::vector<const char*>&, const std::vector<VkExtensionProperties>&) {}
 bool dlss_fg_wanted() { return false; }

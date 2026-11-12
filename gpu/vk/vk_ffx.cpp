@@ -11,6 +11,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
 #include <cmath>
 #include <mutex>
@@ -59,12 +60,15 @@ struct State {
     Image made[4];
     uint64_t frame_id = 0;
     bool fg_reset = true;
-    bool fg_failed = false;
+    uint64_t last_sequence = 0;   // (FrameInputs::sequence of the last frame made: a gap after it is a reset)
 };
 State& st() {
     static State s;
     return s;
 }
+// (the frame generation context could not be made, for the run. Its own atomic, not State's: max_frames reads it on the
+// menu's and the draws' threads)
+std::atomic<bool> fg_failed{false};
 
 void message(uint32_t type, const wchar_t* text) {
     char b[512];
@@ -337,12 +341,13 @@ void probe_frames() {
 
 uint32_t max_frames() {
     static const uint32_t cap = (uint32_t)std::clamp(env_int("RX_VK_FFX_FG_MAX", 1), 1, 4);
-    return frames_supported() ? cap : 0;
+    // (0 once its context could not be made: the row then shows Auto, and the scene's inputs are no longer kept for it)
+    return frames_supported() && !fg_failed.load(std::memory_order_relaxed) ? cap : 0;
 }
 
 bool generate(VkCommandBuffer cmd, const FrameInputs& in) {
     State& s = st();
-    if (s.fg_failed || !frames_supported()) return false;
+    if (fg_failed || !frames_supported()) return false;
     if (!in.color || !in.depth || !in.motion || !in.width || !in.height || !in.render_width || !in.render_height ||
         in.frames < 1 || in.frames > max_frames() || !(in.near_plane > 0.0f) || !(in.fov_y > 0.0f))
         return false;
@@ -375,13 +380,13 @@ bool generate(VkCommandBuffer cmd, const FrameInputs& in) {
                  "generation is off",
                  (unsigned)r);
             s.fg = nullptr;
-            s.fg_failed = true;
+            fg_failed = true;
             return false;
         }
         for (Image& m : s.made)
             if (!make(cmd, m, in.color_format, in.width, in.height)) {
                 drop_framegen();
-                s.fg_failed = true;
+                fg_failed = true;
                 return false;
             }
         s.fg_w = in.width, s.fg_h = in.height, s.fg_rw = in.width, s.fg_rh = in.height;
@@ -394,7 +399,9 @@ bool generate(VkCommandBuffer cmd, const FrameInputs& in) {
         logf("vk: amd fsr 4: %s frame generation at %ux%u", s.fg_provider.c_str(), s.fg_w, s.fg_h);
     }
     s.frame_id++;
-    const bool reset = in.reset || s.fg_reset;
+    // (a present this did not make since the last one, the built-in's or one without the scene's inputs: AMD's runtime
+    // is told consecutive frame ids, so the gap is said as a reset, or it would interpolate from the picture before it)
+    const bool reset = in.reset || s.fg_reset || in.sequence != s.last_sequence + 1;
     s.fg_reset = false;
 
     // Configure, once a frame, with the frame id going up by exactly one each time (anything else resets
@@ -469,6 +476,7 @@ bool generate(VkCommandBuffer cmd, const FrameInputs& in) {
             logf("vk: amd fsr 4: frame generation of %u frames was refused (FSR API result %u)", in.frames, (unsigned)r);
         return false;
     }
+    s.last_sequence = in.sequence;   // (only a frame it made: after a refused one the next is a reset)
     return true;
 }
 

@@ -325,8 +325,9 @@ uint32_t asked() {
     }();
     if (env >= 0) return env ? 1u : 0u;
     // (opt-in: the renderer's own blend at 2x, see above. hookshot fork: the Frame generation by row's AMD FSR 3.1 is that
-    // choice made in the menu, framegen_methods.h)
-    return opts.framegen_by == framegen_methods::FSR3 ? 1u : 0u;
+    // choice made in the menu, framegen_methods.h. Only at 2x, the one set it makes: at Off, Auto and 3x and up the scene's
+    // inputs are not kept for nothing)
+    return opts.framegen_by == framegen_methods::FSR3 && opts.framegen == 2 ? 1u : 0u;
 }
 
 /// A memory dependency over the whole queue, in the synchronization2 form this renderer loads.
