@@ -322,7 +322,7 @@ def render_lines(state, width, height, command, log_path, colour=True):
         st = state.by_id.get(sid)
         if st is None:
             parts.append(paint("[%s]" % label, "wait", colour))
-        elif sid == state.current:
+        elif sid == state.current and state.finished is None:
             f = st.get("progress")
             if sid == "compile" and state.plan_total:
                 f = float(state.files_done) / max(1, state.plan_total)
