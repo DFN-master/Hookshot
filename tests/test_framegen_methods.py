@@ -30,13 +30,14 @@ def main():
             ("return fgm::pick(fgm::effective(v, framegen_by_available()), want, dir, framegen_by_available());", menu,
              "the row choosing through framegen_methods.h"),
             ("if (r.value == &opts.framegen_by) v = framegen_by_pick(*r.value, v, dir);", menu, "set_row choosing that way"),
-            ("return t[fgm::effective(v, framegen_by_available())];", menu, "the row showing the value in effect"),
+            ("const int e = fgm::effective(v, framegen_by_available());", menu, "the row showing the value in effect"),
+            ("if (!who) return t[e];", menu, "the row's value in effect where no one is named at Auto"),
             ("opts.framegen_by = fgm::from_old(old_method)", menu, "an older file's Frame generation method"),
             ("fgm::effective(env_method >= 0 ? env_method : opts.framegen_by, fgm::available(framegen_here()))", fg,
              "vk_framegen.cpp choosing through framegen_methods.h"),
             ("ffx::max_frames()", fg, "FSR 4 frame generation within its limit"),
             ("set->made = dlss_fg_frames(", fg, "upstream's DLSS Frame Generation first, as upstream has it"),
-            ("if (set->made == 0 && blend && m > 1 && ffx_set_wanted(m)) set->made = ffx_frames(cmd, *set, cur, uw, uh, m - 1, sequence);",
+            ("if (set->made == 0 && blend && mk > 1 && ffx_set_wanted(mk)) {\n        set->made = ffx_frames(cmd, *set, cur, uw, uh, mk - 1, sequence);",
              fg, "FSR 4 frame generation making the sets it makes whole, after DLSS's and before the renderer's own"),
             ("return opts.framegen_by == framegen_methods::FSR3 && opts.framegen == 2 ? 1u : 0u;", fi, "the row's AMD FSR 3.1 asking for it")):
         if needle not in where:

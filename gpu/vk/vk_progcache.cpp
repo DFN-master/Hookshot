@@ -35,6 +35,7 @@
 
 #include "shader_recompiler/shader_info.h"
 #include "hookshot_env.h"
+#include "fallback_loaded.h"
 #include "fallback_size_policy.h"
 #include "vk_paths.h"
 #include "vk_internal.h"
@@ -745,6 +746,15 @@ std::unordered_set<uint64_t> program_cache_kept_keys() {
         if (!kv.second.empty()) keys.insert(kv.first);
     return keys;
 }
+std::vector<uint64_t> program_cache_compute_keys() {
+    disk_init();
+    std::vector<uint64_t> keys;
+    if (!disk_on) return keys;
+    std::lock_guard lk(disk_mu);
+    for (const auto& kv : disk_records)
+        if (!kv.second.empty() && (kv.second[0].kind & 1)) keys.push_back(kv.first);
+    return keys;
+}
 std::string program_cache_path() {
     disk_init();
     return disk_on ? disk_path : std::string();
@@ -801,19 +811,40 @@ size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const
         for (auto& p : made[i]) variants.push_back(std::move(p));
         for (auto& p : variants) n++, fn(*p);
     }
+    // (and the mesh fallback programs in memory already, whose records an earlier read took: the state lists' programs in the
+    // start that prepared the shaders. They had no compute pipelines until their first draw, which was left out: fallback_loaded.h)
+    static const bool loaded_too = fallback_loaded::on(getenv("RX_VK_FALLBACK_LOADED"));
+    if (fallbacks && loaded_too) {
+        std::unordered_set<uint64_t> given;
+        for (const auto& w : work) given.insert(w.first);
+        const size_t loaded = fallback_loaded::each(programs, given, fn);
+        if (loaded) logf("vk: %zu mesh fallback programs read in earlier in this start are made ready with the rest", loaded);
+        n += loaded;
+    }
     return n;
 }
 
 /// (hookshot) Program key's kept variants made for fn, then let go (modules and layouts): the records stay for play
 void program_cache_borrow(uint64_t key, const std::function<void(Program&)>& fn) {
     std::vector<std::unique_ptr<Program>> variants;
+    // Own the handles before loading: both the loader and the callback may throw.
+    // Program's vectors are RAII-managed, but its Vulkan handles are not.
+    struct Cleanup {
+        std::vector<std::unique_ptr<Program>>& variants;
+        static void release(Program& p) {
+            for (Stage& st : p.stages)
+                if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr), st.module = VK_NULL_HANDLE;
+            if (p.layout) vkDestroyPipelineLayout(dev.device, p.layout, nullptr), p.layout = VK_NULL_HANDLE;
+            if (p.set_layout) vkDestroyDescriptorSetLayout(dev.device, p.set_layout, nullptr), p.set_layout = VK_NULL_HANDLE;
+        }
+        ~Cleanup() {
+            for (auto& p : variants) release(*p);
+        }
+    } cleanup{variants};
     program_cache_load(key, variants, true);
     for (auto& p : variants) {
         fn(*p);
-        for (Stage& st : p->stages)
-            if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr);
-        if (p->layout) vkDestroyPipelineLayout(dev.device, p->layout, nullptr);
-        if (p->set_layout) vkDestroyDescriptorSetLayout(dev.device, p->set_layout, nullptr);
+        Cleanup::release(*p);   // (release each variant before starting the next one)
     }
 }
 
