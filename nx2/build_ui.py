@@ -286,7 +286,12 @@ class Screen:
             return
         size = shutil.get_terminal_size((100, 30))
         lines = render_lines(state, size.columns, size.lines, command, log_path, self.colour)
-        sys.stdout.write("\x1b[H" + "\n".join(lines) + "\x1b[J")
+        # (each line is erased to its end: a shorter line must not leave the tail of the one before it)
+        out = ["\x1b[H"]
+        for line in lines:
+            out.append(line + "\x1b[K\n")
+        out.append("\x1b[J")
+        sys.stdout.write("".join(out))
         sys.stdout.flush()
 
 
@@ -497,13 +502,17 @@ def demo_events():
              "code_012.c", "host_input.c", "code_021.c", "host_net.c", "code_038.c", "host_vk.c"]
     workers = ["ThreadPoolExecutor-0_0", "ThreadPoolExecutor-0_1", "ThreadPoolExecutor-0_2",
                "ThreadPoolExecutor-0_3", "ThreadPoolExecutor-0_4", "ThreadPoolExecutor-0_5"]
+    # (the six jobs a build starts together, then one started as each one ends)
+    for i, name in enumerate(names[:6]):
+        yield "@@work %s %d %s" % (name, 4 + i % 7, workers[i % len(workers)])
     for i, name in enumerate(names):
         mb = 4 + i % 7
-        yield "@@work %s %d %s" % (name, mb, workers[i % len(workers)])
-        time.sleep(0.18)
         secs = 1.2 + i % 4
         yield "@@file %s %.1f %s" % (name, secs, "cached" if i % 3 == 0 else "new")
         yield "  %-16s %4d MB  %6.1fs  (%.0fs)" % (name, mb, secs, i * 1.5)
+        if i + 6 < len(names):
+            nxt = names[i + 6]
+            yield "@@work %s %d %s" % (nxt, 4 + (i + 6) % 7, workers[(i + 6) % len(workers)])
         if i in (5, 9):
             yield "@@eta %d" % (900 - i * 60)
     yield "@@stage finish Putting the game folder together"
